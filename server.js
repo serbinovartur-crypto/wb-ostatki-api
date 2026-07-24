@@ -66,11 +66,14 @@ app.get("/api/state/:key", async (req, res) => {
 app.put("/api/state/:key", requireApiKey, async (req, res) => {
   try {
     const value = req.body;
+    // Важно: библиотека pg передаёт JS-массивы/объекты в свой формат Postgres-массива,
+    // а не в JSON, поэтому для колонки jsonb значение нужно явно сериализовать в текст
+    // и привести типом ::jsonb — иначе INSERT падает с ошибкой "invalid input syntax for type json".
     await pool.query(
       `INSERT INTO app_state (key, value, updated_at)
-       VALUES ($1, $2, now())
+       VALUES ($1, $2::jsonb, now())
        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
-      [req.params.key, value]
+      [req.params.key, JSON.stringify(value)]
     );
     res.json({ ok: true });
   } catch (e) {
