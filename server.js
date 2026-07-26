@@ -182,11 +182,6 @@ async function fetchWbCardsFromWildberries() {
     const json = await res.json();
     const cards = json.cards || [];
     allCards = allCards.concat(cards);
-    if (page === 0 && cards.length) {
-      // Временный лог для проверки реальной формы объекта photos — пригодится,
-      // чтобы убедиться, что мы берём правильное поле со ссылкой на фото.
-      console.log("WB card sample:", JSON.stringify(cards[0]).slice(0, 1500));
-    }
     const nextCursor = json.cursor || {};
     if (!cards.length || cards.length < cursor.limit) break;
     cursor = { updatedAt: nextCursor.updatedAt, nmID: nextCursor.nmID, limit: 100 };
@@ -202,7 +197,8 @@ async function refreshWbCardsCache() {
       var photo = null;
       if (Array.isArray(c.photos) && c.photos.length) {
         var p = c.photos[0];
-        photo = p.big || p.c516x688 || p.c246x328 || p.square || p.tm || null;
+        // square/c246x328 — небольшие превью, удобные для таблицы; big — на случай, если их нет
+        photo = p.square || p.c246x328 || p.tm || p.big || null;
       }
       return { nmID: c.nmID, vendorCode: c.vendorCode, title: c.title, photo: photo };
     });
