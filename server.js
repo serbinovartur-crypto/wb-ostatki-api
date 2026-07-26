@@ -158,6 +158,83 @@ app.post("/api/wb/stock/refresh", requireApiKey, async (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------------------------------------------------------------------------
+// Wildberries: карточки товаров (Content API) — нужны для артикула продавца
+// (vendorCode) и фото по товарам, которых нет в нашем собственном списке.
+const WB_CARDS_URL = "https://content-api.wildberries.ru/content/v2/get/cards/list";
+
+async function fetchWbCardsFromWildberries() {
+  if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
+  let cursor = { limit: 100 };
+  let allCards = [];
+  for (let page = 0; page < 50; page++) { // защита от бесконечного цикла
+    const res = await fetch(WB_CARDS_URL, {
+      method: "POST",
+      headers: { Authorization: WB_API_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        settings: { sort: { ascending: true }, cursor: cursor, filter: { withPhoto: -1 } },
+      }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error("WB Content API ответил " + res.status + ": " + text);
+    }
+    const json = await res.json();
+    const cards = json.cards || [];
+    allCards = allCards.concat(cards);
+    if (page === 0 && cards.length) {
+      // Временный лог для проверки реальной формы объекта photos — пригодится,
+      // чтобы убедиться, что мы берём правильное поле со ссылкой на фото.
+      console.log("WB card sample:", JSON.stringify(cards[0]).slice(0, 1500));
+    }
+    const nextCursor = json.cursor || {};
+    if (!cards.length || cards.length < cursor.limit) break;
+    cursor = { updatedAt: nextCursor.updatedAt, nmID: nextCursor.nmID, limit: 100 };
+  }
+  return allCards;
+}
+
+async function refreshWbCardsCache() {
+  try {
+    const cards = await fetchWbCardsFromWildberries();
+    // Оставляем только то, что реально нужно сайту, чтобы не раздувать базу
+    const slim = cards.map(function (c) {
+      var photo = null;
+      if (Array.isArray(c.photos) && c.photos.length) {
+        var p = c.photos[0];
+        photo = p.big || p.c516x688 || p.c246x328 || p.square || p.tm || null;
+      }
+      return { nmID: c.nmID, vendorCode: c.vendorCode, title: c.title, photo: photo };
+    });
+    const snapshot = { fetchedAt: new Date().toISOString(), cards: slim, error: null };
+    await pool.query(
+      `INSERT INTO app_state (key, value, updated_at)
+       VALUES ('wb_cards_cache', $1::jsonb, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [JSON.stringify(snapshot)]
+    );
+    console.log("WB cards cache refreshed:", slim.length, "cards");
+  } catch (e) {
+    console.error("Failed to refresh WB cards cache:", e.message);
+  }
+}
+
+app.get("/api/wb/cards", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT value FROM app_state WHERE key = 'wb_cards_cache'");
+    if (rows.length === 0) return res.json({ fetchedAt: null, cards: [], error: null });
+    res.json(rows[0].value);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "db error" });
+  }
+});
+
+app.post("/api/wb/cards/refresh", requireApiKey, async (req, res) => {
+  await refreshWbCardsCache();
+  res.json({ ok: true });
+});
+
 const PORT = process.env.PORT || 3000;
 
 ensureSchema()
@@ -165,7 +242,9 @@ ensureSchema()
     app.listen(PORT, () => console.log("wb-ostatki-api listening on " + PORT));
     if (WB_API_TOKEN) {
       refreshWbStockCache(); // сразу при старте сервиса
+      refreshWbCardsCache();
       setInterval(refreshWbStockCache, 20 * 60 * 1000); // и затем каждые 20 минут
+      setInterval(refreshWbCardsCache, 20 * 60 * 1000);
     } else {
       console.log("WB_API_TOKEN не задан — синхронизация остатков ВБ отключена");
     }
