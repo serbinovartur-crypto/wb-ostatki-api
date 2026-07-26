@@ -89,18 +89,32 @@ app.put("/api/state/:key", requireApiKey, async (req, res) => {
 // последний снимок в ту же таблицу app_state (ключ "wb_stock_cache").
 // Сайт всегда читает уже готовый кэш через GET /api/wb/stock.
 const WB_API_TOKEN = process.env.WB_API_TOKEN || null;
-const WB_STOCKS_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/stocks";
+// Старый метод statistics-api.wildberries.ru/api/v1/supplier/stocks Wildberries отключил 20.07.2026.
+// Актуальный метод — Stocks Report (категория токена "Аналитика"), домен seller-analytics-api.wildberries.ru.
+const WB_STOCKS_URL = "https://seller-analytics-api.wildberries.ru/api/analytics/v1/stocks-report/wb-warehouses";
 
 async function fetchWbStocksFromWildberries() {
   if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
-  // Далёкая дата в прошлом: метод не хранит историю, а всегда отдаёт текущий снимок остатков.
-  const url = WB_STOCKS_URL + "?dateFrom=2020-01-01";
-  const res = await fetch(url, { headers: { Authorization: WB_API_TOKEN } });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error("WB API ответил " + res.status + ": " + text);
+  let offset = 0;
+  const limit = 100000;
+  let allItems = [];
+  for (let page = 0; page < 10; page++) { // защита от бесконечного цикла
+    const res = await fetch(WB_STOCKS_URL, {
+      method: "POST",
+      headers: { Authorization: WB_API_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({ limit, offset }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error("WB API ответил " + res.status + ": " + text);
+    }
+    const json = await res.json();
+    const items = (json && json.data && json.data.items) || [];
+    allItems = allItems.concat(items);
+    if (items.length < limit) break;
+    offset += limit;
   }
-  return res.json();
+  return allItems;
 }
 
 async function refreshWbStockCache() {
