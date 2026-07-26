@@ -82,11 +82,79 @@ app.put("/api/state/:key", requireApiKey, async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Wildberries: остатки на складах ВБ (Statistics API).
+// У этого метода жёсткий лимит — 1 запрос в минуту, поэтому мы не дёргаем его
+// на каждое открытие сайта, а раз в 20 минут сами тянем данные и кладём
+// последний снимок в ту же таблицу app_state (ключ "wb_stock_cache").
+// Сайт всегда читает уже готовый кэш через GET /api/wb/stock.
+const WB_API_TOKEN = process.env.WB_API_TOKEN || null;
+const WB_STOCKS_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/stocks";
+
+async function fetchWbStocksFromWildberries() {
+  if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
+  // Далёкая дата в прошлом: метод не хранит историю, а всегда отдаёт текущий снимок остатков.
+  const url = WB_STOCKS_URL + "?dateFrom=2020-01-01";
+  const res = await fetch(url, { headers: { Authorization: WB_API_TOKEN } });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error("WB API ответил " + res.status + ": " + text);
+  }
+  return res.json();
+}
+
+async function refreshWbStockCache() {
+  try {
+    const data = await fetchWbStocksFromWildberries();
+    const snapshot = { fetchedAt: new Date().toISOString(), rows: data, error: null };
+    await pool.query(
+      `INSERT INTO app_state (key, value, updated_at)
+       VALUES ('wb_stock_cache', $1::jsonb, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [JSON.stringify(snapshot)]
+    );
+    console.log("WB stock cache refreshed:", Array.isArray(data) ? data.length : 0, "rows");
+  } catch (e) {
+    console.error("Failed to refresh WB stock cache:", e.message);
+    // Сохраняем ошибку в кэш, чтобы сайт мог её показать вместо молчаливого "пусто"
+    await pool.query(
+      `INSERT INTO app_state (key, value, updated_at)
+       VALUES ('wb_stock_cache', $1::jsonb, now())
+       ON CONFLICT (key) DO UPDATE SET value = app_state.value || $1::jsonb, updated_at = now()`,
+      [JSON.stringify({ error: e.message, checkedAt: new Date().toISOString() })]
+    ).catch(() => {});
+  }
+}
+
+// Отдаёт последний сохранённый снимок остатков ВБ (без обращения к самому WB на каждый запрос)
+app.get("/api/wb/stock", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT value FROM app_state WHERE key = 'wb_stock_cache'");
+    if (rows.length === 0) return res.json({ fetchedAt: null, rows: [], error: null });
+    res.json(rows[0].value);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "db error" });
+  }
+});
+
+// Принудительное обновление кэша прямо сейчас (для ручной проверки), требует X-Api-Key
+app.post("/api/wb/stock/refresh", requireApiKey, async (req, res) => {
+  await refreshWbStockCache();
+  res.json({ ok: true });
+});
+
 const PORT = process.env.PORT || 3000;
 
 ensureSchema()
   .then(() => {
     app.listen(PORT, () => console.log("wb-ostatki-api listening on " + PORT));
+    if (WB_API_TOKEN) {
+      refreshWbStockCache(); // сразу при старте сервиса
+      setInterval(refreshWbStockCache, 20 * 60 * 1000); // и затем каждые 20 минут
+    } else {
+      console.log("WB_API_TOKEN не задан — синхронизация остатков ВБ отключена");
+    }
   })
   .catch((e) => {
     console.error("Failed to init schema", e);
