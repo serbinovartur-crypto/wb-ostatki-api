@@ -200,7 +200,12 @@ async function refreshWbCardsCache() {
         // square/c246x328 — небольшие превью, удобные для таблицы; big — на случай, если их нет
         photo = p.square || p.c246x328 || p.tm || p.big || null;
       }
-      return { nmID: c.nmID, vendorCode: c.vendorCode, title: c.title, photo: photo };
+      // sizes нужны, чтобы потом сопоставлять chrtID (из заказов FBS) и techSize
+      // (из приёмки FBO) с нашими размерами S/M/L/XL/XXL.
+      var sizes = Array.isArray(c.sizes) ? c.sizes.map(function (s) {
+        return { chrtID: s.chrtID, techSize: s.techSize, wbSize: s.wbSize, skus: s.skus || [] };
+      }) : [];
+      return { nmID: c.nmID, vendorCode: c.vendorCode, title: c.title, photo: photo, sizes: sizes };
     });
     const snapshot = { fetchedAt: new Date().toISOString(), cards: slim, error: null };
     await pool.query(
@@ -231,6 +236,304 @@ app.post("/api/wb/cards/refresh", requireApiKey, async (req, res) => {
   res.json({ ok: true });
 });
 
+// ---------------------------------------------------------------------------
+// Автоматическое списание остатков при отгрузке (ФБС) и приёмке (ФБО).
+//
+// Идея: остатки по размерам (Упакованные/Неупакованные) теперь хранятся не в
+// статичном HTML, а в этой же БД (ключи "stock_packed" / "stock_unpacked",
+// формат { "Название товара": { S,M,L,XL,XXL } }). "Общее" на сайте всегда
+// считается как их сумма — отдельно не хранится, чтобы не расходиться.
+//
+// ФБС: триггер — поставка (marketplace-api) перешла в статус "в доставке"
+// (поле done=true, включается методом .../deliver). Как только видим новую
+// такую поставку, находим её заказы (метод /api/v3/orders, поле supplyId)
+// и списываем по 1 шт. за заказ.
+//
+// ФБО: триггер — в отчёте по поставке (supplies-api, .../goods) выросло поле
+// acceptedQuantity по конкретному штрихкоду ("Принято"). Списываем именно
+// дельту (разницу с прошлым разом), а не всё количество поставки сразу.
+//
+// Сопоставление "какой nmId/chrtId — какой наш товар и размер" — через:
+//  - "sku_product_map": { "nmId": "Название товара" } — заполняется вручную
+//    (через PUT /api/state/sku_product_map), т.к. это те же данные, что уже
+//    введены на сайте (артикулы в колонке "Артикул").
+//  - карточки WB (wb_cards_cache) — там же теперь хранятся размеры товара
+//    (chrtID/techSize/wbSize), чтобы перевести chrtId/techSize в S/M/L/XL/XXL.
+//
+// Если товар или размер распознать не удалось — ничего не списываем и пишем
+// в журнал запись с unresolved:true, чтобы это было видно и можно было
+// поправить sku_product_map, а не тихо портить остатки угадыванием.
+
+const WB_MARKETPLACE_SUPPLIES_URL = "https://marketplace-api.wildberries.ru/api/v3/supplies";
+const WB_MARKETPLACE_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders";
+const WB_SUPPLIES_FBO_URL = "https://supplies-api.wildberries.ru/api/v1/supplies";
+const OUR_SIZES = ["S", "M", "L", "XL", "XXL"];
+
+async function loadJson(key, fallback) {
+  const { rows } = await pool.query("SELECT value FROM app_state WHERE key = $1", [key]);
+  return rows.length ? rows[0].value : fallback;
+}
+
+async function saveJson(key, value) {
+  await pool.query(
+    `INSERT INTO app_state (key, value, updated_at)
+     VALUES ($1, $2::jsonb, now())
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    [key, JSON.stringify(value)]
+  );
+}
+
+async function appendDeductionLog(entry) {
+  const log = await loadJson("deduction_log", []);
+  log.unshift(Object.assign({ ts: new Date().toISOString() }, entry));
+  if (log.length > 500) log.length = 500;
+  await saveJson("deduction_log", log);
+}
+
+function normalizeSize(raw) {
+  if (!raw) return null;
+  const up = String(raw).trim().toUpperCase();
+  return OUR_SIZES.indexOf(up) !== -1 ? up : null;
+}
+
+function buildChrtIndex(cardsCache) {
+  // chrtID -> { nmID, techSize, wbSize } — нужно, чтобы по chrtId из заказа
+  // ФБС узнать, какой это размер.
+  const idx = {};
+  ((cardsCache && cardsCache.cards) || []).forEach(function (c) {
+    (c.sizes || []).forEach(function (s) {
+      idx[String(s.chrtID)] = { nmID: c.nmID, techSize: s.techSize, wbSize: s.wbSize };
+    });
+  });
+  return idx;
+}
+
+// Списывает qty штук указанного размера товара: сначала из "Упакованные",
+// остаток (если не хватило) — из "Неупакованные". Если после этого всё ещё
+// не хватает — просто уходим в 0, глубже минуса не пишем, и отмечаем
+// insufficient, чтобы это было видно в журнале.
+async function deductUnits(productName, size, qty, context) {
+  if (!productName || !size) {
+    await appendDeductionLog(
+      Object.assign(
+        { product: productName || null, size: size || null, qty: qty, unresolved: true, note: "товар или размер не распознаны — сверьте sku_product_map / карточку WB" },
+        context
+      )
+    );
+    return;
+  }
+  const packed = await loadJson("stock_packed", {});
+  const unpacked = await loadJson("stock_unpacked", {});
+  if (!packed[productName]) packed[productName] = { S: 0, M: 0, L: 0, XL: 0, XXL: 0 };
+  if (!unpacked[productName]) unpacked[productName] = { S: 0, M: 0, L: 0, XL: 0, XXL: 0 };
+
+  const have = Number(packed[productName][size]) || 0;
+  const fromPacked = Math.min(have, qty);
+  packed[productName][size] = have - fromPacked;
+
+  let remaining = qty - fromPacked;
+  let fromUnpacked = 0;
+  if (remaining > 0) {
+    const haveU = Number(unpacked[productName][size]) || 0;
+    fromUnpacked = Math.min(haveU, remaining);
+    unpacked[productName][size] = haveU - fromUnpacked;
+    remaining -= fromUnpacked;
+  }
+
+  await saveJson("stock_packed", packed);
+  await saveJson("stock_unpacked", unpacked);
+  await appendDeductionLog(
+    Object.assign(
+      {
+        product: productName,
+        size: size,
+        qty: qty,
+        fromPacked: fromPacked,
+        fromUnpacked: fromUnpacked,
+        insufficient: remaining > 0,
+        shortfall: remaining,
+      },
+      context
+    )
+  );
+}
+
+async function fetchAllFbsSupplies() {
+  let next = 0;
+  let all = [];
+  for (let page = 0; page < 50; page++) {
+    const res = await fetch(WB_MARKETPLACE_SUPPLIES_URL + "?limit=1000&next=" + next, {
+      headers: { Authorization: WB_API_TOKEN },
+    });
+    if (!res.ok) throw new Error("marketplace-api /supplies " + res.status + ": " + (await res.text().catch(() => "")));
+    const json = await res.json();
+    const supplies = json.supplies || [];
+    all = all.concat(supplies);
+    if (!supplies.length || json.next === next || json.next == null) break;
+    next = json.next;
+  }
+  return all;
+}
+
+async function fetchFbsOrdersInWindow(dateFrom, dateTo) {
+  let next = 0;
+  let all = [];
+  for (let page = 0; page < 50; page++) {
+    const url = WB_MARKETPLACE_ORDERS_URL + "?limit=1000&next=" + next + "&dateFrom=" + dateFrom + "&dateTo=" + dateTo;
+    const res = await fetch(url, { headers: { Authorization: WB_API_TOKEN } });
+    if (!res.ok) throw new Error("marketplace-api /orders " + res.status + ": " + (await res.text().catch(() => "")));
+    const json = await res.json();
+    const orders = json.orders || [];
+    all = all.concat(orders);
+    if (!orders.length || json.next === next || json.next == null) break;
+    next = json.next;
+  }
+  return all;
+}
+
+async function runFbsPoller() {
+  if (!WB_API_TOKEN) return;
+  try {
+    const supplies = await fetchAllFbsSupplies();
+    const processed = await loadJson("fbs_processed_supplies", {});
+    const newlyDone = supplies.filter(function (s) { return s.done && !processed[s.id]; });
+    if (!newlyDone.length) return;
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const dateFrom = nowSec - 30 * 24 * 3600; // API отдаёт максимум 30 дней за раз
+    const orders = await fetchFbsOrdersInWindow(dateFrom, nowSec);
+    const ordersBySupply = {};
+    orders.forEach(function (o) {
+      if (!o.supplyId) return;
+      if (!ordersBySupply[o.supplyId]) ordersBySupply[o.supplyId] = [];
+      ordersBySupply[o.supplyId].push(o);
+    });
+
+    const cardsCache = await loadJson("wb_cards_cache", { cards: [] });
+    const chrtIndex = buildChrtIndex(cardsCache);
+    const skuMap = await loadJson("sku_product_map", {});
+
+    for (const supply of newlyDone) {
+      const supplyOrders = ordersBySupply[supply.id] || [];
+      if (!supplyOrders.length) {
+        // Заказы этой поставки не попали в окно последних 30 дней — такое
+        // бывает редко, но лучше явно отметить, чем промолчать.
+        await appendDeductionLog({
+          source: "fbs",
+          supplyId: supply.id,
+          unresolved: true,
+          note: "не нашли заказы этой поставки за последние 30 дней",
+        });
+        processed[supply.id] = true;
+        continue;
+      }
+      for (const order of supplyOrders) {
+        const nm = String(order.nmId);
+        const productName = skuMap[nm] || null;
+        const sizeInfo = chrtIndex[String(order.chrtId)];
+        const size = sizeInfo ? normalizeSize(sizeInfo.wbSize || sizeInfo.techSize) : null;
+        await deductUnits(productName, size, 1, {
+          source: "fbs",
+          supplyId: supply.id,
+          orderId: order.id,
+          nmId: order.nmId,
+          chrtId: order.chrtId,
+        });
+      }
+      processed[supply.id] = true;
+    }
+    await saveJson("fbs_processed_supplies", processed);
+  } catch (e) {
+    console.error("FBS poller error:", e.message);
+  }
+}
+
+async function fetchAllFboSupplies() {
+  const now = new Date();
+  const from = new Date(now.getTime() - 60 * 24 * 3600 * 1000);
+  let offset = 0;
+  const limit = 1000;
+  let all = [];
+  for (let page = 0; page < 20; page++) {
+    const res = await fetch(WB_SUPPLIES_FBO_URL + "?limit=" + limit + "&offset=" + offset, {
+      method: "POST",
+      headers: { Authorization: WB_API_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({ dates: [{ from: from.toISOString(), to: now.toISOString() }] }),
+    });
+    if (!res.ok) throw new Error("supplies-api /supplies " + res.status + ": " + (await res.text().catch(() => "")));
+    const json = await res.json();
+    const supplies = json.supplies || json.data || [];
+    all = all.concat(supplies);
+    if (supplies.length < limit) break;
+    offset += limit;
+  }
+  return all;
+}
+
+async function fetchFboSupplyGoods(supplyId) {
+  const res = await fetch(WB_SUPPLIES_FBO_URL + "/" + supplyId + "/goods?limit=1000&offset=0", {
+    headers: { Authorization: WB_API_TOKEN },
+  });
+  if (!res.ok) throw new Error("supplies-api /goods " + res.status + ": " + (await res.text().catch(() => "")));
+  return await res.json();
+}
+
+async function runFboPoller() {
+  if (!WB_API_TOKEN) return;
+  try {
+    const supplies = await fetchAllFboSupplies();
+    const acceptedState = await loadJson("fbo_accepted_state", {});
+    const skuMap = await loadJson("sku_product_map", {});
+
+    for (const supply of supplies) {
+      // Название поля с ID поставки в этом методе не проверено вживую на
+      // 100% по документации — подстраховываемся под разные варианты.
+      const supplyId = supply.id || supply.ID || supply.supplyID || supply.incomeID;
+      if (!supplyId) continue;
+      let goods;
+      try {
+        goods = await fetchFboSupplyGoods(supplyId);
+      } catch (e) {
+        continue;
+      }
+      const list = Array.isArray(goods) ? goods : goods.goods || [];
+      for (const g of list) {
+        const key = supplyId + ":" + g.barcode;
+        const prevAccepted = Number(acceptedState[key]) || 0;
+        const nowAccepted = Number(g.acceptedQuantity) || 0;
+        const delta = nowAccepted - prevAccepted;
+        if (delta > 0) {
+          const productName = skuMap[String(g.nmID)] || null;
+          const size = normalizeSize(g.techSize);
+          await deductUnits(productName, size, delta, {
+            source: "fbo",
+            supplyId: supplyId,
+            barcode: g.barcode,
+            nmId: g.nmID,
+          });
+        }
+        acceptedState[key] = nowAccepted;
+      }
+    }
+    await saveJson("fbo_accepted_state", acceptedState);
+  } catch (e) {
+    console.error("FBO poller error:", e.message);
+  }
+}
+
+// Журнал списаний — что и когда списалось, чтобы можно было проверить.
+app.get("/api/deductions", async (req, res) => {
+  const log = await loadJson("deduction_log", []);
+  res.json({ entries: log });
+});
+
+// Ручной запуск (для проверки), требует X-Api-Key
+app.post("/api/deductions/run", requireApiKey, async (req, res) => {
+  await runFbsPoller();
+  await runFboPoller();
+  res.json({ ok: true });
+});
+
 const PORT = process.env.PORT || 3000;
 
 ensureSchema()
@@ -241,6 +544,16 @@ ensureSchema()
       refreshWbCardsCache();
       setInterval(refreshWbStockCache, 20 * 60 * 1000); // и затем каждые 20 минут
       setInterval(refreshWbCardsCache, 20 * 60 * 1000);
+      // Списания по ФБС/ФБО — через 2 минуты после старта (дать кэшу карточек
+      // успеть заполниться) и затем каждые 10 минут.
+      setTimeout(function () {
+        runFbsPoller();
+        runFboPoller();
+      }, 2 * 60 * 1000);
+      setInterval(function () {
+        runFbsPoller();
+        runFboPoller();
+      }, 10 * 60 * 1000);
     } else {
       console.log("WB_API_TOKEN не задан — синхронизация остатков ВБ отключена");
     }
