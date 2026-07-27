@@ -431,7 +431,9 @@ async function runFbsPoller() {
         const nm = String(order.nmId);
         const productName = skuMap[nm] || null;
         const sizeInfo = chrtIndex[String(order.chrtId)];
-        const size = sizeInfo ? normalizeSize(sizeInfo.wbSize || sizeInfo.techSize) : null;
+        // techSize у одежды на этом аккаунте — это буквенный размер (S/M/L/XL/XXL),
+        // а wbSize — российский числовой размер (46/48/50...), он нам не подходит.
+        const size = sizeInfo ? normalizeSize(sizeInfo.techSize || sizeInfo.wbSize) : null;
         await deductUnits(productName, size, 1, {
           source: "fbs",
           supplyId: supply.id,
