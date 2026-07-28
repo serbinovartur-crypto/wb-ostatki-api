@@ -308,10 +308,20 @@ function buildChrtIndex(cardsCache) {
   return idx;
 }
 
+// Для этих двух товаров, если и "Упакованные", и "Неупакованные" по нужному
+// размеру уже дошли до нуля, разрешено доспиывать остаток из "Брак (волна)" —
+// пользователь явно попросил только для зелёной и синей рубашки (не для
+// серой, у которой тоже есть брак, но так решили сознательно).
+const BRAK_FALLBACK = {
+  "Зелёная полоска, кор. рукав": "Зелёная, кор. рукав (брак, волна)",
+  "Синяя полоска, кор. рукав": "Синяя, кор. рукав (брак, волна)",
+};
+
 // Списывает qty штук указанного размера товара: сначала из "Упакованные",
-// остаток (если не хватило) — из "Неупакованные". Если после этого всё ещё
-// не хватает — просто уходим в 0, глубже минуса не пишем, и отмечаем
-// insufficient, чтобы это было видно в журнале.
+// остаток (если не хватило) — из "Неупакованные", и если это тоже кончилось —
+// для зелёной/синей рубашки последним источником идёт "Брак (волна)"
+// (см. BRAK_FALLBACK). Если и брака не хватает — уходим в 0, глубже минуса
+// не пишем, и отмечаем insufficient, чтобы это было видно в журнале.
 async function deductUnits(productName, size, qty, context) {
   if (!productName || !size) {
     await appendDeductionLog(
@@ -342,6 +352,19 @@ async function deductUnits(productName, size, qty, context) {
 
   await saveJson("stock_packed", packed);
   await saveJson("stock_unpacked", unpacked);
+
+  let fromBrak = 0;
+  const brakName = BRAK_FALLBACK[productName];
+  if (remaining > 0 && brakName) {
+    const brak = await loadJson("stock_brak", {});
+    if (!brak[brakName]) brak[brakName] = { S: 0, M: 0, L: 0, XL: 0, XXL: 0 };
+    const haveB = Number(brak[brakName][size]) || 0;
+    fromBrak = Math.min(haveB, remaining);
+    brak[brakName][size] = haveB - fromBrak;
+    remaining -= fromBrak;
+    await saveJson("stock_brak", brak);
+  }
+
   await appendDeductionLog(
     Object.assign(
       {
@@ -350,6 +373,7 @@ async function deductUnits(productName, size, qty, context) {
         qty: qty,
         fromPacked: fromPacked,
         fromUnpacked: fromUnpacked,
+        fromBrak: fromBrak,
         insufficient: remaining > 0,
         shortfall: remaining,
       },
