@@ -237,6 +237,44 @@ app.post("/api/wb/cards/refresh", requireApiKey, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Заказы (спрос) за период — нужно для расчёта, сколько поставить на неделю.
+// Метод старый (Statistics API v1), но, в отличие от /supplier/stocks,
+// Wildberries его пока не отключал. Считаем каждый некэнселенный заказ как
+// 1 проданную единицу; nmId+techSize берём прямо из ответа (строкой), поэтому
+// сопоставление с chrtId/картой размеров тут не нужно.
+const WB_ORDERS_STAT_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/orders";
+
+async function fetchWbOrdersStats(dateFromISO) {
+  if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
+  const url = WB_ORDERS_STAT_URL + "?dateFrom=" + encodeURIComponent(dateFromISO) + "&flag=0";
+  const res = await fetch(url, { headers: { Authorization: WB_API_TOKEN } });
+  if (!res.ok) throw new Error("statistics-api /orders " + res.status + ": " + (await res.text().catch(() => "")));
+  return await res.json();
+}
+
+// Отдаёт агрегат "сколько штук заказано за период" по каждому nmId+techSize —
+// сырые данные, агрегацию по нашим товарам/названиям делает сайт сам
+// (у него уже есть sku -> имя товара из своей вёрстки).
+app.get("/api/wb/orders-summary", async (req, res) => {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 30);
+    const dateFrom = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
+    const orders = await fetchWbOrdersStats(dateFrom);
+    const byKey = {};
+    (orders || []).forEach(function (o) {
+      if (o.isCancel) return; // отменённые не считаем спросом
+      const key = String(o.nmId) + "|" + (o.techSize || "");
+      if (!byKey[key]) byKey[key] = { nmId: o.nmId, techSize: o.techSize || null, qty: 0 };
+      byKey[key].qty += 1;
+    });
+    res.json({ days: days, dateFrom: dateFrom, items: Object.values(byKey) });
+  } catch (e) {
+    console.error("Failed to fetch WB orders stats:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Автоматическое списание остатков при отгрузке (ФБС) и приёмке (ФБО).
 //
 // Идея: остатки по размерам (Упакованные/Неупакованные) теперь хранятся не в
