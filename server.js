@@ -159,6 +159,89 @@ app.post("/api/wb/stock/refresh", requireApiKey, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// "Реальный" остаток по конкретной карточке (проверка/сверка вручную) —
+// в отличие от общего кэша (/api/wb/stock), тут остаток разбит по конкретным
+// складам и сразу отфильтрован по признаку "склад сейчас активен" (поле
+// isActive в /api/v1/warehouses). Нужно из-за того, что часть складов ВБ
+// физически сгорела/закрыта, а в обычном кэше остатков их товар всё ещё
+// числится — из-за этого сайт показывал больше, чем реально можно купить.
+// Метод "Данные по размеру" — тот же токен категории "Аналитика", что и для
+// /stocks-report/wb-warehouses (seller-analytics-api.wildberries.ru).
+// Важно: это НЕ гарантированно совпадает день-в-день с тем, что видит живой
+// покупатель в корзине (тот учитывает ещё и доставку в конкретный регион,
+// и обновляется быстрее раза в час) — но исключает склады, которые WB сам
+// считает закрытыми, чего наш обычный кэш не делал вообще.
+const WB_WAREHOUSES_URL = "https://supplies-api.wildberries.ru/api/v1/warehouses";
+const WB_STOCK_SIZES_URL = "https://seller-analytics-api.wildberries.ru/api/v2/stocks-report/products/sizes";
+
+async function fetchWbWarehouses() {
+  if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
+  const res = await fetch(WB_WAREHOUSES_URL, { headers: { Authorization: WB_API_TOKEN } });
+  if (!res.ok) throw new Error("supplies-api /warehouses " + res.status + ": " + (await res.text().catch(() => "")));
+  return await res.json();
+}
+
+async function fetchRealStockForNm(nmID) {
+  if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
+  const today = new Date().toISOString().slice(0, 10);
+  const res = await fetch(WB_STOCK_SIZES_URL, {
+    method: "POST",
+    headers: { Authorization: WB_API_TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      nmID: Number(nmID),
+      currentPeriod: { start: today, end: today },
+      stockType: "wb",
+      orderBy: { field: "avgOrders", mode: "asc" },
+      includeOffice: true,
+    }),
+  });
+  if (!res.ok) throw new Error("seller-analytics-api /stocks-report/products/sizes " + res.status + ": " + (await res.text().catch(() => "")));
+  const json = await res.json();
+  return (json && json.data) || { offices: [], sizes: [] };
+}
+
+// Скрещивает разбивку остатка по складам (per-размер) со списком складов и их
+// статусом активности, отдаёт и "сырой" итог (как в обычном API), и
+// "реальный" (только активные склады) — чтобы было видно разницу.
+async function fetchRealStockFiltered(nmID) {
+  const [sizeData, warehouses] = await Promise.all([
+    fetchRealStockForNm(nmID),
+    fetchWbWarehouses(),
+  ]);
+  const activeByName = {};
+  (warehouses || []).forEach(function (w) {
+    activeByName[w.name] = w.isActive !== false;
+  });
+  const sizes = (sizeData.sizes || []).map(function (sz) {
+    let rawTotal = 0;
+    let realTotal = 0;
+    const byWarehouse = (sz.offices || []).map(function (o) {
+      const qty = (o.metrics && o.metrics.stockCount) || 0;
+      rawTotal += qty;
+      const known = Object.prototype.hasOwnProperty.call(activeByName, o.officeName);
+      const isActive = known ? activeByName[o.officeName] : true; // неизвестный склад — не зануляем на всякий случай
+      if (isActive) realTotal += qty;
+      return { officeName: o.officeName, qty: qty, isActive: isActive, knownWarehouse: known };
+    });
+    return { techSize: sz.name, chrtID: sz.chrtID, rawTotal: rawTotal, realTotal: realTotal, byWarehouse: byWarehouse };
+  });
+  return { nmID: Number(nmID), sizes: sizes, fetchedAt: new Date().toISOString() };
+}
+
+// Только для ручной проверки конкретного товара — не кэшируется и не
+// вызывается по расписанию (у метода жёсткий лимит запросов), поэтому дергать
+// его для всех 18 товаров разом нельзя, только по одному nmID за раз.
+app.get("/api/wb/real-stock/:nmId", async (req, res) => {
+  try {
+    const data = await fetchRealStockFiltered(req.params.nmId);
+    res.json(data);
+  } catch (e) {
+    console.error("real-stock error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Wildberries: карточки товаров (Content API) — нужны для артикула продавца
 // (vendorCode) и фото по товарам, которых нет в нашем собственном списке.
 const WB_CARDS_URL = "https://content-api.wildberries.ru/content/v2/get/cards/list";
