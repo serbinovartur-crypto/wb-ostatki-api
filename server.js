@@ -228,6 +228,19 @@ async function fetchRealStockFiltered(nmID) {
   return { nmID: Number(nmID), sizes: sizes, fetchedAt: new Date().toISOString() };
 }
 
+// Временный отладочный эндпоинт — сырой список складов ВБ с их isActive,
+// нужен только чтобы вручную сверить имена складов с тем, что возвращает
+// отчёт по остаткам (см. fetchRealStockFiltered). Не выдаёт токен, безопасно
+// оставить без авторизации.
+app.get("/api/wb/warehouses-raw", async (req, res) => {
+  try {
+    const data = await fetchWbWarehouses();
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Только для ручной проверки конкретного товара — не кэшируется и не
 // вызывается по расписанию (у метода жёсткий лимит запросов), поэтому дергать
 // его для всех 18 товаров разом нельзя, только по одному nmID за раз.
