@@ -692,7 +692,12 @@ async function runFboPoller() {
 // Журнал списаний — что и когда списалось, чтобы можно было проверить.
 app.get("/api/deductions", async (req, res) => {
   const log = await loadJson("deduction_log", []);
-  res.json({ entries: log });
+  let entries = log;
+  if (req.query.source) {
+    entries = entries.filter((e) => e.source === req.query.source);
+  }
+  const limit = Number(req.query.limit) || entries.length;
+  res.json({ total: entries.length, entries: entries.slice(-limit) });
 });
 
 // Ручной запуск (для проверки), требует X-Api-Key
@@ -700,6 +705,17 @@ app.post("/api/deductions/run", requireApiKey, async (req, res) => {
   await runFbsPoller();
   await runFboPoller();
   res.json({ ok: true });
+});
+
+// Временный диагностический эндпоинт: ручной запуск FBO-поллера через GET
+// (без API-ключа), чтобы проверить фикс без возможности POST-запросов.
+app.get("/api/wb/run-fbo-now", async (req, res) => {
+  try {
+    await runFboPoller();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
