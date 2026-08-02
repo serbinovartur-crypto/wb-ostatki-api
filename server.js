@@ -700,6 +700,14 @@ app.get("/api/deductions", async (req, res) => {
   res.json({ total: entries.length, entries: entries.slice(-limit) });
 });
 
+// Отдельный путь-алиас на случай, если query-параметры где-то по пути обрезаются.
+app.get("/api/deductions/fbo/:limit", async (req, res) => {
+  const log = await loadJson("deduction_log", []);
+  const entries = log.filter((e) => e.source === "fbo");
+  const limit = Number(req.params.limit) || entries.length;
+  res.json({ total: entries.length, entries: entries.slice(-limit) });
+});
+
 // Ручной запуск (для проверки), требует X-Api-Key
 app.post("/api/deductions/run", requireApiKey, async (req, res) => {
   await runFbsPoller();
