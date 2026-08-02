@@ -1,7 +1,9 @@
 // wb-ostatki-api
 // Простой backend-фундамент для сайта "Остатки товара".
-// Хранит: порядок строк по вкладкам, остатки ВБ (кэш), карточки ВБ (кэш),
-// журнал списаний по ФБС/ФБО, и теперь — финансовую статистику ВБ (кэш).
+// Сейчас хранит: порядок строк по вкладкам (общий для всех устройств).
+// Задуман как основа, на которую позже можно добавить:
+//   - синхронизацию остатков через Wildberries Seller API
+//   - ИИ-помощника с рекомендациями по товару
 //
 // Хранение: одна универсальная таблица key -> value(jsonb).
 // Это сознательно простая схема, чтобы не переделывать структуру БД
@@ -241,7 +243,7 @@ app.get("/api/wb/warehouses-raw", async (req, res) => {
 
 // Только для ручной проверки конкретного товара — не кэшируется и не
 // вызывается по расписанию (у метода жёсткий лимит запросов), поэтому дергать
-// его для всех товаров разом нельзя, только по одному nmID за раз.
+// его для всех 18 товаров разом нельзя, только по одному nmID за раз.
 app.get("/api/wb/real-stock/:nmId", async (req, res) => {
   try {
     const data = await fetchRealStockFiltered(req.params.nmId);
@@ -369,198 +371,6 @@ app.get("/api/wb/orders-summary", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// ФИНАНСОВАЯ СТАТИСТИКА (Реализация, Комиссия, Логистика, Хранение, Штрафы,
-// Доплаты, Удержания, Платная приёмка, СПП) — добавлено при разборе того,
-// откуда MPpulse берёт проценты на дашборде (ДРР/Комиссия/Логистика/
-// Себестоимость считаются от "Реализации", налог = ставка УСН + НДС и т.д.)
-//
-// Источник — официальный "Отчёт о реализации" (детализация), тот же файл,
-// который можно вручную скачать в личном кабинете WB (Финансы → Отчёты).
-// У метода такой же жёсткий лимит запросов, как у остатков, поэтому кэшируем
-// точно по той же схеме: раз в 20 минут сами обновляем, сайт всегда читает
-// готовый кэш.
-//
-// ВАЖНО про поля отчёта (официальные имена от WB, ничего не придумано):
-// - retail_amount     — Реализация (сумма продаж по цене продавца), ₽
-// - ppvz_for_pay       — сумма к перечислению продавцу, ₽ (ближе всего к
-//                        "живым деньгам", но это не то же самое, что
-//                        "Сумма продаж" на дашборде MPpulse — это отдельная
-//                        метрика, тут беру как есть, без досочинения)
-// - ppvz_vw            — вознаграждение (комиссия) WB, ₽
-// - delivery_rub       — логистика, ₽
-// - storage_fee        — хранение, ₽
-// - penalty            — штрафы, ₽
-// - additional_payment — доплаты, ₽
-// - deduction          — удержания, ₽
-// - acceptance         — платная приёмка, ₽
-// - ppvz_spp_prc       — процент СПП по конкретной строке (для справки)
-//
-// ДРР (реклама) сюда не входит — это данные из отдельного API продвижения
-// WB (advert-api, нужен токен категории "Продвижение"), в этом модуле не
-// реализовано. Себестоимость — те цифры, что вы вручную вносите на сайте.
-const WB_FINANCE_REPORT_URL = "https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod";
-const WB_SALES_STAT_URL = "https://statistics-api.wildberries.ru/api/v1/supplier/sales";
-
-// Формат даты, который требует часть методов WB (например supplies-api):
-// YYYY-MM-DD, без времени. Вынесено отдельной функцией, т.к. раньше именно
-// из-за пропуска этого шага падал FBO-поллер (см. фикс ниже по файлу).
-function toWbDate(d) {
-  return d.toISOString().slice(0, 10);
-}
-
-async function fetchWbFinanceReport(dateFrom, dateTo) {
-  if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
-  let rrdid = 0;
-  let all = [];
-  for (let page = 0; page < 50; page++) { // защита от бесконечного цикла
-    const url = WB_FINANCE_REPORT_URL
-      + "?dateFrom=" + encodeURIComponent(dateFrom)
-      + "&dateTo=" + encodeURIComponent(dateTo)
-      + "&rrdid=" + rrdid
-      + "&limit=100000";
-    const res = await fetch(url, { headers: { Authorization: WB_API_TOKEN } });
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error("statistics-api /reportDetailByPeriod " + res.status + ": " + text);
-    }
-    const rows = await res.json();
-    if (!rows || !rows.length) break;
-    all = all.concat(rows);
-    rrdid = rows[rows.length - 1].rrd_id;
-    if (rows.length < 100000) break; // последняя страница
-  }
-  return all;
-}
-
-async function fetchWbSalesStats(dateFromISO) {
-  if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
-  const url = WB_SALES_STAT_URL + "?dateFrom=" + encodeURIComponent(dateFromISO) + "&flag=0";
-  const res = await fetch(url, { headers: { Authorization: WB_API_TOKEN } });
-  if (!res.ok) throw new Error("statistics-api /sales " + res.status + ": " + (await res.text().catch(() => "")));
-  return await res.json();
-}
-
-// Складывает построчный отчёт в те же агрегаты, что мы вручную сверяли
-// с карточками MPpulse (ДРР% и Себестоимость% туда не входят — см. комментарий выше).
-function aggregateFinanceRows(rows) {
-  function sum(field) {
-    return rows.reduce(function (acc, r) { return acc + (Number(r[field]) || 0); }, 0);
-  }
-  const realizacia = sum("retail_amount");
-  const komissiya = sum("ppvz_vw");
-  const logistika = sum("delivery_rub");
-  const hranenie = sum("storage_fee");
-  const shtrafy = sum("penalty");
-  const doplaty = sum("additional_payment");
-  const uderzhaniya = sum("deduction");
-  const platPriemka = sum("acceptance");
-  const kPerechisleniu = sum("ppvz_for_pay");
-
-  const sppRows = rows.filter(function (r) { return r.ppvz_spp_prc !== undefined && r.ppvz_spp_prc !== null; });
-  const avgSppPercent = sppRows.length
-    ? sppRows.reduce(function (a, r) { return a + Number(r.ppvz_spp_prc); }, 0) / sppRows.length
-    : null;
-
-  return {
-    realizacia: realizacia,
-    komissiya: komissiya,
-    logistika: logistika,
-    hranenie: hranenie,
-    shtrafy: shtrafy,
-    doplaty: doplaty,
-    uderzhaniya: uderzhaniya,
-    platPriemka: platPriemka,
-    kPerechisleniu: kPerechisleniu,
-    avgSppPercent: avgSppPercent,
-    rowsCount: rows.length,
-  };
-}
-
-// Кэшируем сырые строки отчёта за скользящее окно в 35 дней — этого хватает,
-// чтобы сайт мог сам агрегировать за любой период до месяца без повторных
-// обращений к WB (у метода жёсткий лимит запросов, как и у остатков).
-async function refreshWbFinanceCache() {
-  try {
-    const dateTo = toWbDate(new Date());
-    const dateFrom = toWbDate(new Date(Date.now() - 35 * 24 * 3600 * 1000));
-    const rows = await fetchWbFinanceReport(dateFrom, dateTo);
-    const snapshot = { fetchedAt: new Date().toISOString(), dateFrom: dateFrom, dateTo: dateTo, rows: rows, error: null };
-    await pool.query(
-      `INSERT INTO app_state (key, value, updated_at)
-       VALUES ('wb_finance_cache', $1::jsonb, now())
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
-      [JSON.stringify(snapshot)]
-    );
-    console.log("WB finance cache refreshed:", rows.length, "rows");
-  } catch (e) {
-    console.error("Failed to refresh WB finance cache:", e.message);
-    await pool.query(
-      `INSERT INTO app_state (key, value, updated_at)
-       VALUES ('wb_finance_cache', $1::jsonb, now())
-       ON CONFLICT (key) DO UPDATE SET value = app_state.value || $1::jsonb, updated_at = now()`,
-      [JSON.stringify({ error: e.message, checkedAt: new Date().toISOString() })]
-    ).catch(() => {});
-  }
-}
-
-// Отдаёт агрегаты за последние N дней (по умолчанию 7, максимум 35 — размер
-// кэшируемого окна), считая по уже сохранённым сырым строкам, без обращения
-// к WB на каждый запрос сайта.
-app.get("/api/wb/finance", async (req, res) => {
-  try {
-    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 7, 1), 35);
-    const { rows } = await pool.query("SELECT value FROM app_state WHERE key = 'wb_finance_cache'");
-    if (rows.length === 0 || !rows[0].value || !rows[0].value.rows) {
-      return res.json({ fetchedAt: null, days: days, error: "кэш ещё не наполнен, подождите первое обновление" });
-    }
-    const cache = rows[0].value;
-    const cutoff = Date.now() - days * 24 * 3600 * 1000;
-    const filtered = cache.rows.filter(function (r) {
-      const d = r.rr_dt || r.sale_dt || r.order_dt;
-      return d && new Date(d).getTime() >= cutoff;
-    });
-    const agg = aggregateFinanceRows(filtered);
-    res.json({ fetchedAt: cache.fetchedAt, days: days, error: cache.error || null, ...agg });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "db error" });
-  }
-});
-
-// Заказы + продажи за период — та же логика, что уже есть в orders-summary,
-// но с денежными суммами (для карточек "Сумма заказов" / "Сумма продаж").
-app.get("/api/wb/orders-sales-summary", async (req, res) => {
-  try {
-    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 7, 1), 30);
-    const dateFrom = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
-    const [orders, sales] = await Promise.all([
-      fetchWbOrdersStats(dateFrom),
-      fetchWbSalesStats(dateFrom),
-    ]);
-    const ordersNotCancelled = (orders || []).filter(function (o) { return !o.isCancel; });
-    const sumZakazov = ordersNotCancelled.reduce(function (a, o) { return a + (Number(o.priceWithDisc) || 0); }, 0);
-    const realSales = (sales || []).filter(function (s) { return s.saleID && String(s.saleID).charAt(0) === "S"; });
-    const sumProdazh = realSales.reduce(function (a, s) { return a + (Number(s.forPay) || 0); }, 0);
-    res.json({
-      days: days,
-      dateFrom: dateFrom,
-      kolZakazov: ordersNotCancelled.length,
-      sumZakazov: sumZakazov,
-      kolProdazh: realSales.length,
-      sumProdazh: sumProdazh,
-    });
-  } catch (e) {
-    console.error("Failed to fetch WB orders/sales summary:", e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post("/api/wb/finance/refresh", requireApiKey, async (req, res) => {
-  await refreshWbFinanceCache();
-  res.json({ ok: true });
-});
-
-// ---------------------------------------------------------------------------
 // Автоматическое списание остатков при отгрузке (ФБС) и приёмке (ФБО).
 //
 // Идея: остатки по размерам (Упакованные/Неупакованные) теперь хранятся не в
@@ -578,11 +388,11 @@ app.post("/api/wb/finance/refresh", requireApiKey, async (req, res) => {
 // дельту (разницу с прошлым разом), а не всё количество поставки сразу.
 //
 // Сопоставление "какой nmId/chrtId — какой наш товар и размер" — через:
-// - "sku_product_map": { "nmId": "Название товара" } — заполняется вручную
-// (через PUT /api/state/sku_product_map), т.к. это те же данные, что уже
-// введены на сайте (артикулы в колонке "Артикул").
-// - карточки WB (wb_cards_cache) — там же теперь хранятся размеры товара
-// (chrtID/techSize/wbSize), чтобы перевести chrtId/techSize в S/M/L/XL/XXL.
+//  - "sku_product_map": { "nmId": "Название товара" } — заполняется вручную
+//    (через PUT /api/state/sku_product_map), т.к. это те же данные, что уже
+//    введены на сайте (артикулы в колонке "Артикул").
+//  - карточки WB (wb_cards_cache) — там же теперь хранятся размеры товара
+//    (chrtID/techSize/wbSize), чтобы перевести chrtId/techSize в S/M/L/XL/XXL.
 //
 // Если товар или размер распознать не удалось — ничего не списываем и пишем
 // в журнал запись с unresolved:true, чтобы это было видно и можно было
@@ -808,16 +618,19 @@ async function fetchAllFboSupplies() {
     const res = await fetch(WB_SUPPLIES_FBO_URL + "?limit=" + limit + "&offset=" + offset, {
       method: "POST",
       headers: { Authorization: WB_API_TOKEN, "Content-Type": "application/json" },
-      // ФИКС: WB требует дату в формате YYYY-MM-DD (ISO Date), а не полный
-      // ISO-timestamp с временем — раньше здесь стояло from.toISOString()
-      // без обрезки, из-за чего WB отвечал 400 "ошибка при считывании даты"
-      // на каждом цикле поллера (см. логи Railway). toWbDate() обрезает
-      // время и оставляет только дату.
-      body: JSON.stringify({ dates: [{ from: toWbDate(from), to: toWbDate(now) }] }),
+      body: JSON.stringify({
+        dates: [
+          {
+            from: from.toISOString().slice(0, 10),
+            till: now.toISOString().slice(0, 10),
+            type: "factDate",
+          },
+        ],
+      }),
     });
     if (!res.ok) throw new Error("supplies-api /supplies " + res.status + ": " + (await res.text().catch(() => "")));
     const json = await res.json();
-    const supplies = json.supplies || json.data || [];
+    const supplies = Array.isArray(json) ? json : json.supplies || json.data || [];
     all = all.concat(supplies);
     if (supplies.length < limit) break;
     offset += limit;
@@ -897,10 +710,8 @@ ensureSchema()
     if (WB_API_TOKEN) {
       refreshWbStockCache(); // сразу при старте сервиса
       refreshWbCardsCache();
-      refreshWbFinanceCache();
       setInterval(refreshWbStockCache, 20 * 60 * 1000); // и затем каждые 20 минут
       setInterval(refreshWbCardsCache, 20 * 60 * 1000);
-      setInterval(refreshWbFinanceCache, 20 * 60 * 1000);
       // Списания по ФБС/ФБО — через 2 минуты после старта (дать кэшу карточек
       // успеть заполниться) и затем каждые 10 минут.
       setTimeout(function () {
