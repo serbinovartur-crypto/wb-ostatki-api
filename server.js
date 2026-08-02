@@ -549,6 +549,33 @@ async function fetchFbsOrdersInWindow(dateFrom, dateTo) {
   return all;
 }
 
+// Здоровье поллеров: чтобы про ошибку (упал целиком запрос к ВБ, а не просто
+// один товар) можно было узнать не заходя в логи Railway, а через простой
+// эндпоинт /api/health/alerts, который проверяется автоматически.
+async function recordPollerHealth(name, ok, errorMessage) {
+  const health = await loadJson("poller_health", {});
+  const now = new Date().toISOString();
+  const prev = health[name] || { consecutiveErrors: 0 };
+  if (ok) {
+    health[name] = {
+      lastRunAt: now,
+      lastSuccessAt: now,
+      lastError: null,
+      lastErrorAt: prev.lastErrorAt || null,
+      consecutiveErrors: 0,
+    };
+  } else {
+    health[name] = {
+      lastRunAt: now,
+      lastSuccessAt: prev.lastSuccessAt || null,
+      lastError: errorMessage,
+      lastErrorAt: now,
+      consecutiveErrors: (Number(prev.consecutiveErrors) || 0) + 1,
+    };
+  }
+  await saveJson("poller_health", health);
+}
+
 async function runFbsPoller() {
   if (!WB_API_TOKEN) return;
   try {
@@ -603,8 +630,10 @@ async function runFbsPoller() {
       processed[supply.id] = true;
     }
     await saveJson("fbs_processed_supplies", processed);
+    await recordPollerHealth("fbs", true);
   } catch (e) {
     console.error("FBS poller error:", e.message);
+    await recordPollerHealth("fbs", false, e.message);
   }
 }
 
@@ -662,6 +691,12 @@ async function runFboPoller() {
       try {
         goods = await fetchFboSupplyGoods(supplyId);
       } catch (e) {
+        await appendDeductionLog({
+          source: "fbo",
+          supplyId: supplyId,
+          unresolved: true,
+          note: "не удалось получить товары поставки (/goods): " + e.message,
+        });
         continue;
       }
       const list = Array.isArray(goods) ? goods : goods.goods || [];
@@ -684,10 +719,54 @@ async function runFboPoller() {
       }
     }
     await saveJson("fbo_accepted_state", acceptedState);
+    await recordPollerHealth("fbo", true);
   } catch (e) {
     console.error("FBO poller error:", e.message);
+    await recordPollerHealth("fbo", false, e.message);
   }
 }
+
+// Алерты по здоровью поллеров: отдаёт только то, что появилось нового с
+// прошлой проверки (сам двигает чекпоинт), чтобы можно было дёргать эндпоинт
+// периодически и получать "тишину", если всё в порядке.
+app.get("/api/health/alerts", async (req, res) => {
+  try {
+    const health = await loadJson("poller_health", {});
+    const checkpoint = await loadJson("alerts_checkpoint", { since: null });
+    const sinceMs = checkpoint.since ? new Date(checkpoint.since).getTime() : 0;
+
+    const errors = [];
+    for (const name of ["fbs", "fbo"]) {
+      const h = health[name];
+      if (h && h.lastError && h.lastErrorAt && new Date(h.lastErrorAt).getTime() > sinceMs) {
+        errors.push({
+          poller: name,
+          error: h.lastError,
+          at: h.lastErrorAt,
+          consecutiveErrors: h.consecutiveErrors,
+          lastSuccessAt: h.lastSuccessAt,
+        });
+      }
+    }
+
+    const log = await loadJson("deduction_log", []);
+    const newUnresolved = log.filter((e) => e.unresolved && e.ts && new Date(e.ts).getTime() > sinceMs);
+
+    const now = new Date().toISOString();
+    await saveJson("alerts_checkpoint", { since: now });
+
+    res.json({
+      checkedFrom: checkpoint.since,
+      checkedTo: now,
+      hasAlerts: errors.length > 0 || newUnresolved.length > 0,
+      pollerErrors: errors,
+      newUnresolved: newUnresolved,
+      health: health,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // Журнал списаний — что и когда списалось, чтобы можно было проверить.
 app.get("/api/deductions", async (req, res) => {
