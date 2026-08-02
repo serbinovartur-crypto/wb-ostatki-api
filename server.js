@@ -12,6 +12,7 @@
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
+const crypto = require("crypto");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -802,6 +803,173 @@ app.get("/api/wb/run-fbo-now", requireApiKey, async (req, res) => {
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+
+// ---------------------------------------------------------------------------
+// Конкуренты: отслеживание позиций наших карточек в блоке "Смотрите также"
+// (в обиходе — "Похожие товары") на карточках конкурентов на WB.
+//
+// Важно про источник данных: сам сервер НИКОГДА не ходит на wildberries.ru
+// за этим блоком — это нарушало бы условия WB и упиралось бы в антибот-защиту.
+// Данные сюда присылает Claude, который открывает карточку конкурента в
+// обычном браузере пользователя (как реальный человек — без спецмаскировки)
+// и построчно читает, что показано в "Смотрите также". Сервер только хранит
+// присланный результат и сам сопоставляет его с нашими товарами (по nmID из
+// wb_cards_cache), чтобы не полагаться на ручное ведение списка своих nmID.
+
+function extractNmIdFromUrl(url) {
+  const m = String(url || "").match(/catalog\/(\d+)\/detail/);
+  return m ? Number(m[1]) : null;
+}
+
+// Список отслеживаемых конкурентов
+app.get("/api/competitors", async (req, res) => {
+  try {
+    const list = await loadJson("competitors_list", []);
+    res.json({ competitors: list });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Добавить конкурента вручную (по ссылке на его карточку товара на WB)
+app.post("/api/competitors", requireApiKey, async (req, res) => {
+  try {
+    const { url, name } = req.body || {};
+    const nmID = extractNmIdFromUrl(url);
+    if (!nmID) {
+      return res.status(400).json({
+        error: "Не нашли артикул в ссылке. Нужна ссылка вида https://www.wildberries.ru/catalog/123456/detail.aspx",
+      });
+    }
+    const list = await loadJson("competitors_list", []);
+    const item = {
+      id: crypto.randomUUID(),
+      nmID: nmID,
+      url: "https://www.wildberries.ru/catalog/" + nmID + "/detail.aspx",
+      name: (name || "").trim() || ("Конкурент " + nmID),
+      addedAt: new Date().toISOString(),
+    };
+    list.push(item);
+    await saveJson("competitors_list", list);
+    res.json({ ok: true, competitor: item });
+  } catch (e) {
+    console.error("add competitor error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Удалить конкурента и всю накопленную по нему историю
+app.delete("/api/competitors/:id", requireApiKey, async (req, res) => {
+  try {
+    const list = await loadJson("competitors_list", []);
+    const next = list.filter(function (c) { return c.id !== req.params.id; });
+    await saveJson("competitors_list", next);
+    await pool.query("DELETE FROM app_state WHERE key = $1", ["competitor_scan_" + req.params.id]);
+    const flags = await loadJson("competitor_refresh_requests", {});
+    if (flags[req.params.id]) {
+      delete flags[req.params.id];
+      await saveJson("competitor_refresh_requests", flags);
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Кнопка "Обновить" на сайте не может сама завести браузер и обойти
+// конкурента (это делает только Claude в чате) — она лишь ставит отметку
+// "проверить как можно скорее", чтобы запрос было видно и он не потерялся.
+app.post("/api/competitors/:id/request-refresh", async (req, res) => {
+  try {
+    const flags = await loadJson("competitor_refresh_requests", {});
+    flags[req.params.id] = new Date().toISOString();
+    await saveJson("competitor_refresh_requests", flags);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/api/competitors/refresh-requests", async (req, res) => {
+  try {
+    const flags = await loadJson("competitor_refresh_requests", {});
+    res.json({ requests: flags });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Приём результата обхода одного конкурента. items — сырой список товаров,
+// увиденных в блоке "Смотрите также", в порядке появления (position 1, 2, 3…).
+// Сервер сам оставляет только те, что совпадают с нашими товарами (по nmID
+// из wb_cards_cache), остальное отбрасывает — хранить чужие товары незачем.
+app.post("/api/competitors/:id/scan", requireApiKey, async (req, res) => {
+  try {
+    const { items, date } = req.body || {};
+    if (!Array.isArray(items)) {
+      return res.status(400).json({ error: "items должен быть массивом [{nmID, name, position}]" });
+    }
+
+    const list = await loadJson("competitors_list", []);
+    if (!list.some(function (c) { return c.id === req.params.id; })) {
+      return res.status(404).json({ error: "конкурент с таким id не найден" });
+    }
+
+    const cardsCache = await loadJson("wb_cards_cache", { cards: [] });
+    const myCardsByNm = {};
+    (cardsCache.cards || []).forEach(function (c) { myCardsByNm[String(c.nmID)] = c; });
+
+    const matches = items
+      .filter(function (it) { return it && myCardsByNm[String(it.nmID)]; })
+      .map(function (it) {
+        const mine = myCardsByNm[String(it.nmID)];
+        return {
+          nmID: Number(it.nmID),
+          myName: mine.title,
+          myVendorCode: mine.vendorCode,
+          position: Number(it.position) || null,
+        };
+      });
+
+    const day = date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : new Date().toISOString().slice(0, 10);
+    const key = "competitor_scan_" + req.params.id;
+    const data = await loadJson(key, { history: {} });
+    data.history[day] = {
+      scannedAt: new Date().toISOString(),
+      totalSeen: items.length,
+      matches: matches,
+    };
+    // Не храним больше 90 дней истории по одному конкуренту, чтобы база не росла бесконечно
+    const days = Object.keys(data.history).sort();
+    if (days.length > 90) {
+      days.slice(0, days.length - 90).forEach(function (d) { delete data.history[d]; });
+    }
+    await saveJson(key, data);
+
+    const flags = await loadJson("competitor_refresh_requests", {});
+    if (flags[req.params.id]) {
+      delete flags[req.params.id];
+      await saveJson("competitor_refresh_requests", flags);
+    }
+
+    res.json({ ok: true, day: day, matchesFound: matches.length, totalSeen: items.length });
+  } catch (e) {
+    console.error("competitor scan error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// История по конкретному конкуренту — для таблицы на сайте
+app.get("/api/competitors/:id/history", async (req, res) => {
+  try {
+    const key = "competitor_scan_" + req.params.id;
+    const data = await loadJson(key, { history: {} });
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
