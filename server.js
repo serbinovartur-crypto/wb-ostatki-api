@@ -715,67 +715,12 @@ app.post("/api/deductions/run", requireApiKey, async (req, res) => {
   res.json({ ok: true });
 });
 
-// Временный диагностический эндпоинт: ручной запуск FBO-поллера через GET
-// (без API-ключа), чтобы проверить фикс без возможности POST-запросов.
-app.get("/api/wb/run-fbo-now", async (req, res) => {
+// Ручной запуск FBO-поллера через GET (без API-ключа) — для быстрой
+// диагностики без возможности делать POST-запросы из песочницы.
+app.get("/api/wb/run-fbo-now", requireApiKey, async (req, res) => {
   try {
     await runFboPoller();
     res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ОДНОРАЗОВЫЙ откат: первый успешный запуск FBO-поллера (после починки формата
-// запроса к WB) обработал не только текущую поставку, а все поставки за 60 дней
-// назад, т.к. состояние fbo_accepted_state было пустым. Нужно оставить списание
-// только по keepSupplyId, а по остальным — вернуть товар туда, откуда списали.
-app.get("/api/wb/revert-fbo-except/:keepSupplyId", async (req, res) => {
-  try {
-    const keepId = String(req.params.keepSupplyId);
-    const log = await loadJson("deduction_log", []);
-    const packed = await loadJson("stock_packed", {});
-    const unpacked = await loadJson("stock_unpacked", {});
-    const brak = await loadJson("stock_brak", {});
-    const skuMap = await loadJson("sku_product_map", {});
-
-    let reverted = 0;
-    let removed = 0;
-    const keptLog = [];
-    for (const e of log) {
-      if (e.source !== "fbo" || String(e.supplyId) === keepId) {
-        keptLog.push(e);
-        continue;
-      }
-      // Возвращаем товар туда, откуда его списали.
-      if (e.product) {
-        if (e.fromPacked) {
-          if (!packed[e.product]) packed[e.product] = { S: 0, M: 0, L: 0, XL: 0, XXL: 0 };
-          packed[e.product][e.size] = (Number(packed[e.product][e.size]) || 0) + e.fromPacked;
-        }
-        if (e.fromUnpacked) {
-          if (!unpacked[e.product]) unpacked[e.product] = { S: 0, M: 0, L: 0, XL: 0, XXL: 0 };
-          unpacked[e.product][e.size] = (Number(unpacked[e.product][e.size]) || 0) + e.fromUnpacked;
-        }
-        if (e.fromBrak) {
-          const brakName = BRAK_FALLBACK[e.product];
-          if (brakName) {
-            if (!brak[brakName]) brak[brakName] = { S: 0, M: 0, L: 0, XL: 0, XXL: 0 };
-            brak[brakName][e.size] = (Number(brak[brakName][e.size]) || 0) + e.fromBrak;
-          }
-        }
-        reverted++;
-      }
-      removed++;
-      // deduction_log entry просто не переносим в keptLog — журнал остаётся чистым.
-    }
-
-    await saveJson("stock_packed", packed);
-    await saveJson("stock_unpacked", unpacked);
-    await saveJson("stock_brak", brak);
-    await saveJson("deduction_log", keptLog);
-
-    res.json({ ok: true, keptSupplyId: keepId, reverted, removedLogEntries: removed, remainingLogEntries: keptLog.length });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
