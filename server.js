@@ -109,37 +109,11 @@ async function sendTelegram(text) {
   }
 }
 
-// Временный диагностический эндпоинт: отправить тестовое сообщение в Telegram,
-// чтобы проверить, что токен + chat_id настроены верно. Удалить после проверки.
-app.get("/api/telegram/test", async (req, res) => {
+// Ручная проверка Telegram-уведомлений (например, из настроек сайта). Требует X-Api-Key.
+app.get("/api/telegram/test", requireApiKey, async (req, res) => {
   try {
     await sendTelegram("✅ Тестовое сообщение. Если ты это видишь — уведомления по ФБС/ФБО настроены и работают.");
     res.json({ ok: true, sent: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// Временный диагностический эндпоинт: найти chat_id, с которым нужно говорить
-// боту. Пользователь должен сначала написать боту любое сообщение.
-app.get("/api/telegram/find-chat-id", async (req, res) => {
-  if (!TELEGRAM_BOT_TOKEN) return res.status(400).json({ error: "TELEGRAM_BOT_TOKEN не задан" });
-  try {
-    const [meRes, updRes] = await Promise.all([
-      fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe`),
-      fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates`),
-    ]);
-    const meJson = await meRes.json();
-    const json = await updRes.json();
-    const chats = (json.result || []).map((u) => {
-      const msg = u.message || u.edited_message || u.channel_post;
-      return msg && msg.chat ? { chatId: msg.chat.id, name: msg.chat.first_name || msg.chat.title, text: msg.text } : null;
-    }).filter(Boolean);
-    res.json({
-      ok: json.ok,
-      botUsername: meJson && meJson.result ? meJson.result.username : null,
-      chats: chats,
-    });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
