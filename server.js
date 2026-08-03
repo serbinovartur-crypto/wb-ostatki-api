@@ -824,11 +824,29 @@ function extractNmIdFromUrl(url) {
   return m ? Number(m[1]) : null;
 }
 
-// Список отслеживаемых конкурентов
+// Список отслеживаемых конкурентов — сразу с краткой сводкой по последнему
+// обходу (дата, сколько карточек увидели, сколько из них наши), чтобы фронту
+// не нужно было отдельно дёргать историю по каждому конкуренту ради превью-плитки.
 app.get("/api/competitors", async (req, res) => {
   try {
     const list = await loadJson("competitors_list", []);
-    res.json({ competitors: list });
+    const enriched = await Promise.all(
+      list.map(async function (c) {
+        const data = await loadJson("competitor_scan_" + c.id, { history: {} });
+        const days = Object.keys(data.history).sort();
+        const lastDay = days.length ? days[days.length - 1] : null;
+        const lastScan = lastDay
+          ? {
+              day: lastDay,
+              scannedAt: data.history[lastDay].scannedAt,
+              totalSeen: data.history[lastDay].totalSeen,
+              matchesCount: (data.history[lastDay].matches || []).length,
+            }
+          : null;
+        return Object.assign({}, c, { lastScan: lastScan });
+      })
+    );
+    res.json({ competitors: enriched });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -908,15 +926,30 @@ app.get("/api/competitors/refresh-requests", async (req, res) => {
 // из wb_cards_cache), остальное отбрасывает — хранить чужие товары незачем.
 app.post("/api/competitors/:id/scan", requireApiKey, async (req, res) => {
   try {
-    const { items, date } = req.body || {};
+    const { items, date, competitorPhoto, competitorTitle } = req.body || {};
     if (!Array.isArray(items)) {
       return res.status(400).json({ error: "items должен быть массивом [{nmID, name, position}]" });
     }
 
     const list = await loadJson("competitors_list", []);
-    if (!list.some(function (c) { return c.id === req.params.id; })) {
+    const competitorIdx = list.findIndex(function (c) { return c.id === req.params.id; });
+    if (competitorIdx === -1) {
       return res.status(404).json({ error: "конкурент с таким id не найден" });
     }
+
+    // Фото/название карточки конкурента узнаём только во время обхода (сам
+    // сервер на WB не ходит) — если прислали, сохраняем в карточку конкурента,
+    // чтобы показывать на сайте без повторного похода в браузер.
+    let listChanged = false;
+    if (competitorPhoto && list[competitorIdx].photo !== competitorPhoto) {
+      list[competitorIdx].photo = competitorPhoto;
+      listChanged = true;
+    }
+    if (competitorTitle && list[competitorIdx].wbTitle !== competitorTitle) {
+      list[competitorIdx].wbTitle = competitorTitle;
+      listChanged = true;
+    }
+    if (listChanged) await saveJson("competitors_list", list);
 
     const cardsCache = await loadJson("wb_cards_cache", { cards: [] });
     const myCardsByNm = {};
@@ -930,6 +963,7 @@ app.post("/api/competitors/:id/scan", requireApiKey, async (req, res) => {
           nmID: Number(it.nmID),
           myName: mine.title,
           myVendorCode: mine.vendorCode,
+          myPhoto: mine.photo || null,
           position: Number(it.position) || null,
         };
       });
