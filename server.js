@@ -819,6 +819,66 @@ app.get("/api/wb/run-fbo-now", requireApiKey, async (req, res) => {
 // присланный результат и сам сопоставляет его с нашими товарами (по nmID из
 // wb_cards_cache), чтобы не полагаться на ручное ведение списка своих nmID.
 
+// ---------------------------------------------------------------------------
+// Wildberries: реклама (Advertising API) — нужно, чтобы отличать позицию
+// карточки в "Смотрите также", которая выросла органически (от "прогрева"),
+// от позиции, которая держится за счёт активной сейчас платной рекламной
+// кампании с размещением "рекомендации". Кампания в WB может быть нацелена
+// отдельно на поиск и отдельно на рекомендации (см. settings.placements) —
+// нас интересуют только те, что бьют по рекомендательным полкам.
+const WB_ADV_COUNT_URL = "https://advert-api.wildberries.ru/adv/v1/promotion/count";
+const WB_ADV_ADVERTS_URL = "https://advert-api.wildberries.ru/api/advert/v2/adverts";
+const WB_ADV_ACTIVE_STATUS = 9; // по документации WB API: 9 = кампания активна прямо сейчас
+
+async function fetchActiveRecommendationNmIds() {
+  if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
+
+  const countRes = await fetch(WB_ADV_COUNT_URL, {
+    headers: { Authorization: WB_API_TOKEN },
+  });
+  if (!countRes.ok) {
+    const text = await countRes.text().catch(() => "");
+    throw new Error("WB Adv API (count) ответил " + countRes.status + ": " + text);
+  }
+  const countJson = await countRes.json();
+  const activeAdvertIds = [];
+  (countJson.adverts || []).forEach(function (group) {
+    if (group.status === WB_ADV_ACTIVE_STATUS) {
+      (group.advert_list || []).forEach(function (a) { activeAdvertIds.push(a.advertId); });
+    }
+  });
+  if (!activeAdvertIds.length) return [];
+
+  const nmIds = new Set();
+  for (let i = 0; i < activeAdvertIds.length; i += 50) {
+    const batch = activeAdvertIds.slice(i, i + 50);
+    const url = WB_ADV_ADVERTS_URL + "?ids=" + batch.join(",");
+    const res = await fetch(url, { headers: { Authorization: WB_API_TOKEN } });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error("WB Adv API (adverts) ответил " + res.status + ": " + text);
+    }
+    const json = await res.json();
+    (json.adverts || []).forEach(function (advert) {
+      const recomEnabled = advert.settings && advert.settings.placements && advert.settings.placements.recommendations;
+      if (!recomEnabled) return;
+      (advert.nm_settings || []).forEach(function (ns) { nmIds.add(Number(ns.nm_id)); });
+    });
+  }
+  return Array.from(nmIds);
+}
+
+// Диагностический эндпоинт — только чтобы проверить, что у токена есть права
+// на раздел "Продвижение". После проверки можно убрать.
+app.get("/api/ads/test", async (req, res) => {
+  try {
+    const nmIds = await fetchActiveRecommendationNmIds();
+    res.json({ ok: true, activeRecommendationNmIdsCount: nmIds.length, nmIds: nmIds });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 function extractNmIdFromUrl(url) {
   const m = String(url || "").match(/catalog\/(\d+)\/detail/);
   return m ? Number(m[1]) : null;
