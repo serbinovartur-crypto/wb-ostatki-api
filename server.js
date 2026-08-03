@@ -12,6 +12,7 @@
 const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
+const crypto = require("crypto");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -89,42 +90,6 @@ app.put("/api/state/:key", requireApiKey, async (req, res) => {
 // последний снимок в ту же таблицу app_state (ключ "wb_stock_cache").
 // Сайт всегда читает уже готовый кэш через GET /api/wb/stock.
 const WB_API_TOKEN = process.env.WB_API_TOKEN || null;
-
-// ---------------------------------------------------------------------------
-// Telegram-уведомления: бэкенд сам шлёт сообщения боту напрямую (не через
-// Claude), чтобы это работало независимо от того, открыто ли приложение Claude.
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || null;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || null;
-
-async function sendTelegram(text) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-  try {
-    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: text, parse_mode: "HTML" }),
-    });
-  } catch (e) {
-    console.error("Telegram send error:", e.message);
-  }
-}
-
-// Временный диагностический эндпоинт: найти chat_id, с которым нужно говорить
-// боту. Пользователь должен сначала написать боту любое сообщение.
-app.get("/api/telegram/find-chat-id", async (req, res) => {
-  if (!TELEGRAM_BOT_TOKEN) return res.status(400).json({ error: "TELEGRAM_BOT_TOKEN не задан" });
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates`);
-    const json = await r.json();
-    const chats = (json.result || []).map((u) => {
-      const msg = u.message || u.edited_message || u.channel_post;
-      return msg && msg.chat ? { chatId: msg.chat.id, name: msg.chat.first_name || msg.chat.title, text: msg.text } : null;
-    }).filter(Boolean);
-    res.json({ ok: json.ok, chats: chats });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
 // Старый метод statistics-api.wildberries.ru/api/v1/supplier/stocks Wildberries отключил 20.07.2026.
 // Актуальный метод — Stocks Report (категория токена "Аналитика"), домен seller-analytics-api.wildberries.ru.
 const WB_STOCKS_URL = "https://seller-analytics-api.wildberries.ru/api/analytics/v1/stocks-report/wb-warehouses";
@@ -460,34 +425,6 @@ async function appendDeductionLog(entry) {
   await saveJson("deduction_log", log);
 }
 
-// После каждого запуска поллера проверяем, не появились ли новые
-// нераспознанные позиции (товар/поставка, которые не удалось списать
-// автоматически) — и если да, шлём один сводный алерт в Telegram.
-async function notifyNewUnresolved(sinceIso, pollerLabel) {
-  try {
-    const log = await loadJson("deduction_log", []);
-    const sinceMs = new Date(sinceIso).getTime();
-    const fresh = log.filter((e) => e.unresolved && e.ts && new Date(e.ts).getTime() >= sinceMs);
-    if (!fresh.length) return;
-    const lines = fresh.slice(0, 15).map((e) => {
-      const parts = [];
-      if (e.product) parts.push(e.product);
-      if (e.nmId) parts.push("nmID " + e.nmId);
-      if (e.barcode) parts.push("баркод " + e.barcode);
-      if (e.size) parts.push("размер " + e.size);
-      if (e.qty) parts.push(e.qty + " шт.");
-      if (e.supplyId) parts.push("поставка " + e.supplyId);
-      return "• " + (parts.join(", ") || "?") + (e.note ? " — " + e.note : "");
-    });
-    const more = fresh.length > 15 ? `\n…и ещё ${fresh.length - 15}` : "";
-    await sendTelegram(
-      `❗ ${pollerLabel}: не удалось автоматически списать ${fresh.length} позици${fresh.length === 1 ? "ю" : "й"} — товар/размер не распознан. Остаток по ним НЕ уменьшился.\n\n${lines.join("\n")}${more}\n\nНужно вручную сопоставить в sku_product_map.`
-    );
-  } catch (e) {
-    console.error("notifyNewUnresolved error:", e.message);
-  }
-}
-
 function normalizeSize(raw) {
   if (!raw) return null;
   const up = String(raw).trim().toUpperCase();
@@ -620,8 +557,6 @@ async function recordPollerHealth(name, ok, errorMessage) {
   const health = await loadJson("poller_health", {});
   const now = new Date().toISOString();
   const prev = health[name] || { consecutiveErrors: 0 };
-  const wasBroken = (Number(prev.consecutiveErrors) || 0) > 0;
-  const label = name === "fbs" ? "ФБС" : "ФБО";
   if (ok) {
     health[name] = {
       lastRunAt: now,
@@ -630,11 +565,6 @@ async function recordPollerHealth(name, ok, errorMessage) {
       lastErrorAt: prev.lastErrorAt || null,
       consecutiveErrors: 0,
     };
-    if (wasBroken) {
-      await sendTelegram(
-        `✅ Поллер ${label} снова работает.\nОшибка была: ${prev.lastError || "—"}\nС ${prev.lastErrorAt || "?"} до ${now}.`
-      );
-    }
   } else {
     health[name] = {
       lastRunAt: now,
@@ -643,28 +573,17 @@ async function recordPollerHealth(name, ok, errorMessage) {
       lastErrorAt: now,
       consecutiveErrors: (Number(prev.consecutiveErrors) || 0) + 1,
     };
-    if (!wasBroken) {
-      // Сообщаем только при переходе из "работал" в "сломался", а не на
-      // каждом повторе ошибки (иначе будет спам каждые 10 минут).
-      await sendTelegram(
-        `⚠️ Поллер ${label} не может обработать поставки/заказы.\nОшибка: ${errorMessage}\nПоследний успешный запуск: ${prev.lastSuccessAt || "неизвестно"}.\nСписание по этому каналу сейчас НЕ происходит, пока ошибка не устранена.`
-      );
-    }
   }
   await saveJson("poller_health", health);
 }
 
 async function runFbsPoller() {
   if (!WB_API_TOKEN) return;
-  const runStartedAt = new Date().toISOString();
   try {
     const supplies = await fetchAllFbsSupplies();
     const processed = await loadJson("fbs_processed_supplies", {});
     const newlyDone = supplies.filter(function (s) { return s.done && !processed[s.id]; });
-    if (!newlyDone.length) {
-      await recordPollerHealth("fbs", true);
-      return;
-    }
+    if (!newlyDone.length) return;
 
     const nowSec = Math.floor(Date.now() / 1000);
     const dateFrom = nowSec - 30 * 24 * 3600; // API отдаёт максимум 30 дней за раз
@@ -713,7 +632,6 @@ async function runFbsPoller() {
     }
     await saveJson("fbs_processed_supplies", processed);
     await recordPollerHealth("fbs", true);
-    await notifyNewUnresolved(runStartedAt, "ФБС");
   } catch (e) {
     console.error("FBS poller error:", e.message);
     await recordPollerHealth("fbs", false, e.message);
@@ -760,7 +678,6 @@ async function fetchFboSupplyGoods(supplyId) {
 
 async function runFboPoller() {
   if (!WB_API_TOKEN) return;
-  const runStartedAt = new Date().toISOString();
   try {
     const supplies = await fetchAllFboSupplies();
     const acceptedState = await loadJson("fbo_accepted_state", {});
@@ -804,68 +721,9 @@ async function runFboPoller() {
     }
     await saveJson("fbo_accepted_state", acceptedState);
     await recordPollerHealth("fbo", true);
-    await notifyNewUnresolved(runStartedAt, "ФБО");
   } catch (e) {
     console.error("FBO poller error:", e.message);
     await recordPollerHealth("fbo", false, e.message);
-  }
-}
-
-// Ежедневная сводка в Telegram: что отгружено по ФБС, что принято по ФБО,
-// и где не хватило остатка (shortfall > 0 — физически столько не могло
-// списаться, значит на складе, скорее всего, "минус" по сравнению с тем, что
-// показывает ВБ). Отправляется один раз в день, около DAILY_SUMMARY_HOUR_UTC.
-const DAILY_SUMMARY_HOUR_UTC = 17; // 17:00 UTC = 20:00 МСК
-
-async function buildDailySummaryText() {
-  const log = await loadJson("deduction_log", []);
-  const sinceMs = Date.now() - 24 * 3600 * 1000;
-  const recent = log.filter((e) => e.ts && new Date(e.ts).getTime() >= sinceMs);
-
-  const fbs = recent.filter((e) => e.source === "fbs" && !e.unresolved);
-  const fbo = recent.filter((e) => e.source === "fbo" && !e.unresolved);
-  const shortfalls = recent.filter((e) => e.insufficient && e.shortfall > 0);
-  const unresolved = recent.filter((e) => e.unresolved);
-
-  const fbsQty = fbs.reduce((s, e) => s + (Number(e.qty) || 0), 0);
-  const fboQty = fbo.reduce((s, e) => s + (Number(e.qty) || 0), 0);
-  const fboSupplies = new Set(fbo.map((e) => e.supplyId)).size;
-
-  let text = `📦 Дневная сводка за последние 24 часа\n\n`;
-  text += `ФБС: списано ${fbsQty} шт. (${fbs.length} заказ${fbs.length === 1 ? "" : "ов"})\n`;
-  text += `ФБО: списано ${fboQty} шт. по ${fboSupplies} поставк${fboSupplies === 1 ? "е" : "ам"}\n`;
-
-  if (shortfalls.length) {
-    text += `\n⚠️ Не хватило остатка (${shortfalls.length} позиций) — физически столько списать не смогли, вероятно на складе меньше, чем считает система:\n`;
-    shortfalls.slice(0, 15).forEach((e) => {
-      text += `• ${e.product || "?"} (${e.size || "?"}) — не хватило ${e.shortfall} шт.\n`;
-    });
-    if (shortfalls.length > 15) text += `…и ещё ${shortfalls.length - 15}\n`;
-  }
-
-  if (unresolved.length) {
-    text += `\n❗ Нераспознанных позиций за сутки: ${unresolved.length} (см. алерт выше или /api/deductions?source=... )\n`;
-  }
-
-  if (!fbs.length && !fbo.length && !shortfalls.length && !unresolved.length) {
-    text += `\nЗа сутки никаких движений не было.`;
-  }
-
-  return text;
-}
-
-async function runDailySummaryIfDue() {
-  try {
-    const nowDate = new Date();
-    const todayStr = nowDate.toISOString().slice(0, 10);
-    const state = await loadJson("daily_summary_state", { lastDate: null });
-    if (nowDate.getUTCHours() >= DAILY_SUMMARY_HOUR_UTC && state.lastDate !== todayStr) {
-      const text = await buildDailySummaryText();
-      await sendTelegram(text);
-      await saveJson("daily_summary_state", { lastDate: todayStr });
-    }
-  } catch (e) {
-    console.error("runDailySummaryIfDue error:", e.message);
   }
 }
 
@@ -948,6 +806,282 @@ app.get("/api/wb/run-fbo-now", requireApiKey, async (req, res) => {
   }
 });
 
+
+// ---------------------------------------------------------------------------
+// Конкуренты: отслеживание позиций наших карточек в блоке "Смотрите также"
+// (в обиходе — "Похожие товары") на карточках конкурентов на WB.
+//
+// Важно про источник данных: сам сервер НИКОГДА не ходит на wildberries.ru
+// за этим блоком — это нарушало бы условия WB и упиралось бы в антибот-защиту.
+// Данные сюда присылает Claude, который открывает карточку конкурента в
+// обычном браузере пользователя (как реальный человек — без спецмаскировки)
+// и построчно читает, что показано в "Смотрите также". Сервер только хранит
+// присланный результат и сам сопоставляет его с нашими товарами (по nmID из
+// wb_cards_cache), чтобы не полагаться на ручное ведение списка своих nmID.
+
+// ---------------------------------------------------------------------------
+// Wildberries: реклама (Advertising API) — нужно, чтобы отличать позицию
+// карточки в "Смотрите также", которая выросла органически (от "прогрева"),
+// от позиции, которая держится за счёт активной сейчас платной рекламной
+// кампании с размещением "рекомендации". Кампания в WB может быть нацелена
+// отдельно на поиск и отдельно на рекомендации (см. settings.placements) —
+// нас интересуют только те, что бьют по рекомендательным полкам.
+const WB_ADV_COUNT_URL = "https://advert-api.wildberries.ru/adv/v1/promotion/count";
+const WB_ADV_ADVERTS_URL = "https://advert-api.wildberries.ru/api/advert/v2/adverts";
+const WB_ADV_ACTIVE_STATUS = 9; // по документации WB API: 9 = кампания активна прямо сейчас
+
+async function fetchActiveRecommendationNmIds() {
+  if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
+
+  const countRes = await fetch(WB_ADV_COUNT_URL, {
+    headers: { Authorization: WB_API_TOKEN },
+  });
+  if (!countRes.ok) {
+    const text = await countRes.text().catch(() => "");
+    throw new Error("WB Adv API (count) ответил " + countRes.status + ": " + text);
+  }
+  const countJson = await countRes.json();
+  const activeAdvertIds = [];
+  (countJson.adverts || []).forEach(function (group) {
+    if (group.status === WB_ADV_ACTIVE_STATUS) {
+      (group.advert_list || []).forEach(function (a) { activeAdvertIds.push(a.advertId); });
+    }
+  });
+  if (!activeAdvertIds.length) return [];
+
+  const nmIds = new Set();
+  for (let i = 0; i < activeAdvertIds.length; i += 50) {
+    const batch = activeAdvertIds.slice(i, i + 50);
+    const url = WB_ADV_ADVERTS_URL + "?ids=" + batch.join(",");
+    const res = await fetch(url, { headers: { Authorization: WB_API_TOKEN } });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error("WB Adv API (adverts) ответил " + res.status + ": " + text);
+    }
+    const json = await res.json();
+    (json.adverts || []).forEach(function (advert) {
+      const recomEnabled = advert.settings && advert.settings.placements && advert.settings.placements.recommendations;
+      if (!recomEnabled) return;
+      (advert.nm_settings || []).forEach(function (ns) { nmIds.add(Number(ns.nm_id)); });
+    });
+  }
+  return Array.from(nmIds);
+}
+
+// Диагностический эндпоинт — только чтобы проверить, что у токена есть права
+// на раздел "Продвижение". После проверки можно убрать.
+app.get("/api/ads/test", async (req, res) => {
+  try {
+    const nmIds = await fetchActiveRecommendationNmIds();
+    res.json({ ok: true, activeRecommendationNmIdsCount: nmIds.length, nmIds: nmIds });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+function extractNmIdFromUrl(url) {
+  const m = String(url || "").match(/catalog\/(\d+)\/detail/);
+  return m ? Number(m[1]) : null;
+}
+
+// Список отслеживаемых конкурентов — сразу с краткой сводкой по последнему
+// обходу (дата, сколько карточек увидели, сколько из них наши), чтобы фронту
+// не нужно было отдельно дёргать историю по каждому конкуренту ради превью-плитки.
+app.get("/api/competitors", async (req, res) => {
+  try {
+    const list = await loadJson("competitors_list", []);
+    const enriched = await Promise.all(
+      list.map(async function (c) {
+        const data = await loadJson("competitor_scan_" + c.id, { history: {} });
+        const days = Object.keys(data.history).sort();
+        const lastDay = days.length ? days[days.length - 1] : null;
+        const lastScan = lastDay
+          ? {
+              day: lastDay,
+              scannedAt: data.history[lastDay].scannedAt,
+              totalSeen: data.history[lastDay].totalSeen,
+              matchesCount: (data.history[lastDay].matches || []).length,
+            }
+          : null;
+        return Object.assign({}, c, { lastScan: lastScan });
+      })
+    );
+    res.json({ competitors: enriched });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Добавить конкурента вручную (по ссылке на его карточку товара на WB)
+app.post("/api/competitors", requireApiKey, async (req, res) => {
+  try {
+    const { url, name } = req.body || {};
+    const nmID = extractNmIdFromUrl(url);
+    if (!nmID) {
+      return res.status(400).json({
+        error: "Не нашли артикул в ссылке. Нужна ссылка вида https://www.wildberries.ru/catalog/123456/detail.aspx",
+      });
+    }
+    const list = await loadJson("competitors_list", []);
+    const item = {
+      id: crypto.randomUUID(),
+      nmID: nmID,
+      url: "https://www.wildberries.ru/catalog/" + nmID + "/detail.aspx",
+      name: (name || "").trim() || ("Конкурент " + nmID),
+      addedAt: new Date().toISOString(),
+    };
+    list.push(item);
+    await saveJson("competitors_list", list);
+    res.json({ ok: true, competitor: item });
+  } catch (e) {
+    console.error("add competitor error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Удалить конкурента и всю накопленную по нему историю
+app.delete("/api/competitors/:id", requireApiKey, async (req, res) => {
+  try {
+    const list = await loadJson("competitors_list", []);
+    const next = list.filter(function (c) { return c.id !== req.params.id; });
+    await saveJson("competitors_list", next);
+    await pool.query("DELETE FROM app_state WHERE key = $1", ["competitor_scan_" + req.params.id]);
+    const flags = await loadJson("competitor_refresh_requests", {});
+    if (flags[req.params.id]) {
+      delete flags[req.params.id];
+      await saveJson("competitor_refresh_requests", flags);
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Кнопка "Обновить" на сайте не может сама завести браузер и обойти
+// конкурента (это делает только Claude в чате) — она лишь ставит отметку
+// "проверить как можно скорее", чтобы запрос было видно и он не потерялся.
+app.post("/api/competitors/:id/request-refresh", async (req, res) => {
+  try {
+    const flags = await loadJson("competitor_refresh_requests", {});
+    flags[req.params.id] = new Date().toISOString();
+    await saveJson("competitor_refresh_requests", flags);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/api/competitors/refresh-requests", async (req, res) => {
+  try {
+    const flags = await loadJson("competitor_refresh_requests", {});
+    res.json({ requests: flags });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Приём результата обхода одного конкурента. items — сырой список товаров,
+// увиденных в блоке "Смотрите также", в порядке появления (position 1, 2, 3…).
+// Сервер сам оставляет только те, что совпадают с нашими товарами (по nmID
+// из wb_cards_cache), остальное отбрасывает — хранить чужие товары незачем.
+app.post("/api/competitors/:id/scan", requireApiKey, async (req, res) => {
+  try {
+    const { items, date, competitorPhoto, competitorTitle } = req.body || {};
+    if (!Array.isArray(items)) {
+      return res.status(400).json({ error: "items должен быть массивом [{nmID, name, position}]" });
+    }
+
+    const list = await loadJson("competitors_list", []);
+    const competitorIdx = list.findIndex(function (c) { return c.id === req.params.id; });
+    if (competitorIdx === -1) {
+      return res.status(404).json({ error: "конкурент с таким id не найден" });
+    }
+
+    // Фото/название карточки конкурента узнаём только во время обхода (сам
+    // сервер на WB не ходит) — если прислали, сохраняем в карточку конкурента,
+    // чтобы показывать на сайте без повторного похода в браузер.
+    let listChanged = false;
+    if (competitorPhoto && list[competitorIdx].photo !== competitorPhoto) {
+      list[competitorIdx].photo = competitorPhoto;
+      listChanged = true;
+    }
+    if (competitorTitle && list[competitorIdx].wbTitle !== competitorTitle) {
+      list[competitorIdx].wbTitle = competitorTitle;
+      listChanged = true;
+    }
+    if (listChanged) await saveJson("competitors_list", list);
+
+    const cardsCache = await loadJson("wb_cards_cache", { cards: [] });
+    const myCardsByNm = {};
+    (cardsCache.cards || []).forEach(function (c) { myCardsByNm[String(c.nmID)] = c; });
+
+    // Помечаем, есть ли у карточки СЕЙЧАС активная (статус 9) рекламная
+    // кампания с размещением на рекомендации — чтобы отличать позицию,
+    // которая держится за счёт платной рекламы, от органической (от
+    // "прогрева"). Если запрос к рекламному API не удался (нет доступа,
+    // сбой сети) — не роняем сохранение скана, просто помечаем adActive
+    // как null ("неизвестно"), а не false ("точно нет рекламы").
+    let activeRecomNmIds = null;
+    try {
+      activeRecomNmIds = await fetchActiveRecommendationNmIds();
+    } catch (e) {
+      console.error("не удалось получить активные рекламные кампании:", e.message);
+    }
+    const activeRecomSet = activeRecomNmIds ? new Set(activeRecomNmIds) : null;
+
+    const matches = items
+      .filter(function (it) { return it && myCardsByNm[String(it.nmID)]; })
+      .map(function (it) {
+        const mine = myCardsByNm[String(it.nmID)];
+        return {
+          nmID: Number(it.nmID),
+          myName: mine.title,
+          myVendorCode: mine.vendorCode,
+          myPhoto: mine.photo || null,
+          position: Number(it.position) || null,
+          adActive: activeRecomSet ? activeRecomSet.has(Number(it.nmID)) : null,
+        };
+      });
+
+    const day = date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : new Date().toISOString().slice(0, 10);
+    const key = "competitor_scan_" + req.params.id;
+    const data = await loadJson(key, { history: {} });
+    data.history[day] = {
+      scannedAt: new Date().toISOString(),
+      totalSeen: items.length,
+      matches: matches,
+    };
+    // Не храним больше 90 дней истории по одному конкуренту, чтобы база не росла бесконечно
+    const days = Object.keys(data.history).sort();
+    if (days.length > 90) {
+      days.slice(0, days.length - 90).forEach(function (d) { delete data.history[d]; });
+    }
+    await saveJson(key, data);
+
+    const flags = await loadJson("competitor_refresh_requests", {});
+    if (flags[req.params.id]) {
+      delete flags[req.params.id];
+      await saveJson("competitor_refresh_requests", flags);
+    }
+
+    res.json({ ok: true, day: day, matchesFound: matches.length, totalSeen: items.length });
+  } catch (e) {
+    console.error("competitor scan error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// История по конкретному конкуренту — для таблицы на сайте
+app.get("/api/competitors/:id/history", async (req, res) => {
+  try {
+    const key = "competitor_scan_" + req.params.id;
+    const data = await loadJson(key, { history: {} });
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 
 ensureSchema()
@@ -970,12 +1104,6 @@ ensureSchema()
       }, 10 * 60 * 1000);
     } else {
       console.log("WB_API_TOKEN не задан — синхронизация остатков ВБ отключена");
-    }
-    if (TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) {
-      // Ежедневная сводка: проверяем раз в полчаса, не пора ли отправить
-      // (сама функция следит, чтобы за день отправить максимум один раз).
-      setInterval(runDailySummaryIfDue, 30 * 60 * 1000);
-      runDailySummaryIfDue();
     }
   })
   .catch((e) => {
