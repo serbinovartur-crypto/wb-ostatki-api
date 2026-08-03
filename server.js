@@ -109,6 +109,17 @@ async function sendTelegram(text) {
   }
 }
 
+// Временный диагностический эндпоинт: отправить тестовое сообщение в Telegram,
+// чтобы проверить, что токен + chat_id настроены верно. Удалить после проверки.
+app.get("/api/telegram/test", async (req, res) => {
+  try {
+    await sendTelegram("✅ Тестовое сообщение. Если ты это видишь — уведомления по ФБС/ФБО настроены и работают.");
+    res.json({ ok: true, sent: !!(TELEGRAM_BOT_TOKEN && TELEGRAM_CHAT_ID) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // Временный диагностический эндпоинт: найти chat_id, с которым нужно говорить
 // боту. Пользователь должен сначала написать боту любое сообщение.
 app.get("/api/telegram/find-chat-id", async (req, res) => {
