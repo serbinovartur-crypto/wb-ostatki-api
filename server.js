@@ -114,13 +114,21 @@ async function sendTelegram(text) {
 app.get("/api/telegram/find-chat-id", async (req, res) => {
   if (!TELEGRAM_BOT_TOKEN) return res.status(400).json({ error: "TELEGRAM_BOT_TOKEN не задан" });
   try {
-    const r = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates`);
-    const json = await r.json();
+    const [meRes, updRes] = await Promise.all([
+      fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe`),
+      fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates`),
+    ]);
+    const meJson = await meRes.json();
+    const json = await updRes.json();
     const chats = (json.result || []).map((u) => {
       const msg = u.message || u.edited_message || u.channel_post;
       return msg && msg.chat ? { chatId: msg.chat.id, name: msg.chat.first_name || msg.chat.title, text: msg.text } : null;
     }).filter(Boolean);
-    res.json({ ok: json.ok, chats: chats });
+    res.json({
+      ok: json.ok,
+      botUsername: meJson && meJson.result ? meJson.result.username : null,
+      chats: chats,
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
