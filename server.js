@@ -996,12 +996,15 @@ app.get("/api/competitors", async (req, res) => {
         const data = await loadJson("competitor_scan_" + c.id, { history: {} });
         const days = Object.keys(data.history).sort();
         const lastDay = days.length ? days[days.length - 1] : null;
+        const prevDay = days.length > 1 ? days[days.length - 2] : null;
         const lastScan = lastDay
           ? {
               day: lastDay,
               scannedAt: data.history[lastDay].scannedAt,
               totalSeen: data.history[lastDay].totalSeen,
               matchesCount: (data.history[lastDay].matches || []).length,
+              prevMatchesCount: prevDay ? (data.history[prevDay].matches || []).length : null,
+              delta: prevDay ? (data.history[lastDay].matches || []).length - (data.history[prevDay].matches || []).length : null,
             }
           : null;
         return Object.assign({}, c, { lastScan: lastScan });
