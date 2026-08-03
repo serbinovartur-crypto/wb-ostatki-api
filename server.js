@@ -1007,7 +1007,7 @@ app.get("/api/competitors", async (req, res) => {
               delta: prevDay ? (data.history[lastDay].matches || []).length - (data.history[prevDay].matches || []).length : null,
             }
           : null;
-        return Object.assign({}, c, { lastScan: lastScan });
+        return Object.assign({}, c, { lastScan: lastScan, active: c.active !== false });
       })
     );
     res.json({ competitors: enriched });
@@ -1033,6 +1033,7 @@ app.post("/api/competitors", requireApiKey, async (req, res) => {
       url: "https://www.wildberries.ru/catalog/" + nmID + "/detail.aspx",
       name: (name || "").trim() || ("Конкурент " + nmID),
       addedAt: new Date().toISOString(),
+    active: true,
     };
     list.push(item);
     await saveJson("competitors_list", list);
@@ -1064,6 +1065,23 @@ app.delete("/api/competitors/:id", requireApiKey, async (req, res) => {
 // Кнопка "Обновить" на сайте не может сама завести браузер и обойти
 // конкурента (это делает только Claude в чате) — она лишь ставит отметку
 // "проверить как можно скорее", чтобы запрос было видно и он не потерялся.
+// ÐÐºÐ»ÑÑÐ¸ÑÑ/Ð²ÑÐºÐ»ÑÑÐ¸ÑÑ ÐºÐ¾Ð½ÐºÑÑÐµÐ½ÑÐ° Ð±ÐµÐ· ÑÐ´Ð°Ð»ÐµÐ½Ð¸Ñ â Ð½ÐµÐ°ÐºÑÐ¸Ð²Ð½ÑÐµ Ð¿ÑÐ¾Ð¿ÑÑÐºÐ°ÑÑÑÑ Ð¿ÑÐ¸ Ð¼Ð°ÑÑÐ¾Ð²Ð¾Ð¼ Ð¾Ð±Ð½Ð¾Ð²Ð»ÐµÐ½Ð¸Ð¸
+app.post("/api/competitors/:id/active", requireApiKey, async (req, res) => {
+  try {
+    const { active } = req.body || {};
+    const list = await loadJson("competitors_list", []);
+    const idx = list.findIndex(function (c) { return c.id === req.params.id; });
+    if (idx === -1) {
+      return res.status(404).json({ error: "ÐºÐ¾Ð½ÐºÑÑÐµÐ½Ñ Ñ ÑÐ°ÐºÐ¸Ð¼ qd Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½" });
+    }
+    list[idx].active = active !== false;
+    await saveJson("competitors_list", list);
+    res.json({ ok: true, competitor: list[idx] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/api/competitors/:id/request-refresh", async (req, res) => {
   try {
     const flags = await loadJson("competitor_refresh_requests", {});
