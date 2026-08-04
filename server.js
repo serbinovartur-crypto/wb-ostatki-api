@@ -757,9 +757,17 @@ async function fetchAllFboSupplies() {
 }
 
 async function fetchFboSupplyGoods(supplyId) {
-  const res = await fetch(WB_SUPPLIES_FBO_URL + "/" + supplyId + "/goods?limit=1000&offset=0", {
-    headers: { Authorization: WB_API_TOKEN },
-  });
+  let res;
+  try {
+    res = await fetch(WB_SUPPLIES_FBO_URL + "/" + supplyId + "/goods?limit=1000&offset=0", {
+      headers: { Authorization: WB_API_TOKEN },
+    });
+  } catch (e) {
+    // Сетевая ошибка (таймаут, разрыв соединения и т.п.) — тут нет res.status,
+    // но код причины (ECONNRESET/ETIMEDOUT/...) обычно есть у cause.
+    e.code = (e.cause && e.cause.code) || e.code || "network";
+    throw e;
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     const err = new Error("supplies-api /goods " + res.status + ": " + text);
@@ -788,17 +796,29 @@ async function runFboPoller() {
 
     const supplySummaries = {}; // supplyId -> qty списано
 
+    // Поставки, которые уже подтверждённо "устоялись" (два прогона подряд без
+    // изменений после того, как мы их хоть раз успешно прочитали) — больше не
+    // трогаем их вообще, ни чтением /goods, ни тем более алертами. Это и есть
+    // ответ на просьбу "не перепроверяй старые поставки, они уже сделаны".
+    const settledState = await loadJson("fbo_settled_supplies", {});
+    const seenState = await loadJson("fbo_seen_supplies", {});
+    let skippedSettledCount = 0;
+
     for (const supply of supplies) {
       // Название поля с ID поставки в этом методе не проверено вживую на
       // 100% по документации — подстраховываемся под разные варианты.
       const supplyId = supply.id || supply.ID || supply.supplyID || supply.incomeID;
       if (!supplyId) continue;
+      if (settledState[String(supplyId)]) {
+        skippedSettledCount++;
+        continue;
+      }
       let goods;
       try {
         goods = await fetchFboSupplyGoods(supplyId);
         if (fetchAlertState[String(supplyId)]) delete fetchAlertState[String(supplyId)];
       } catch (e) {
-        const marker = "status:" + (e.status || "unknown");
+        const marker = "status:" + (e.status || e.code || "unknown");
         await appendDeductionLog({
           source: "fbo",
           supplyId: supplyId,
@@ -808,18 +828,20 @@ async function runFboPoller() {
           note: "не удалось получить товары поставки (/goods): " + e.message,
         });
         if (fetchAlertState[String(supplyId)] !== marker) {
-          newFetchErrors.push({ supplyId: supplyId, status: e.status || "?" });
+          newFetchErrors.push({ supplyId: supplyId, status: e.status || e.code || "сетевая ошибка" });
           fetchAlertState[String(supplyId)] = marker;
         }
         continue;
       }
       const list = Array.isArray(goods) ? goods : goods.goods || [];
+      let supplyDeltaTotal = 0;
       for (const g of list) {
         const key = supplyId + ":" + g.barcode;
         const prevAccepted = Number(acceptedState[key]) || 0;
         const nowAccepted = Number(g.acceptedQuantity) || 0;
         const delta = nowAccepted - prevAccepted;
         if (delta > 0) {
+          supplyDeltaTotal += delta;
           const productName = skuMap[String(g.nmID)] || null;
           const size = normalizeSize(g.techSize);
           const result = await deductUnits(productName, size, delta, {
@@ -835,9 +857,17 @@ async function runFboPoller() {
         }
         acceptedState[key] = nowAccepted;
       }
+      // Если поставку уже видели раньше (это не первый успешный прогон по ней)
+      // и в этот раз изменений ноль — считаем её устоявшейся и больше не трогаем.
+      if (seenState[String(supplyId)] && supplyDeltaTotal === 0) {
+        settledState[String(supplyId)] = new Date().toISOString();
+      }
+      seenState[String(supplyId)] = true;
     }
     await saveJson("fbo_accepted_state", acceptedState);
     await saveJson("fbo_fetch_alert_state", fetchAlertState);
+    await saveJson("fbo_settled_supplies", settledState);
+    await saveJson("fbo_seen_supplies", seenState);
     await recordPollerHealth("fbo", true);
 
     const supplyIds = Object.keys(supplySummaries);
