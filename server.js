@@ -729,6 +729,12 @@ async function runFbsPoller() {
 async function fetchAllFboSupplies() {
   const now = new Date();
   const from = new Date(now.getTime() - 60 * 24 * 3600 * 1000);
+  // "till" — только дата без времени. Если передать сегодняшнее число, WB,
+  // похоже, трактует это как начало дня (00:00) и обрезает всё, что случилось
+  // сегодня позже полуночи — из-за этого свежепринятые сегодня поставки не
+  // попадали в список вообще. Берём "завтра", чтобы гарантированно захватить
+  // весь сегодняшний день.
+  const till = new Date(now.getTime() + 24 * 3600 * 1000);
   let offset = 0;
   const limit = 1000;
   let all = [];
@@ -740,7 +746,7 @@ async function fetchAllFboSupplies() {
         dates: [
           {
             from: from.toISOString().slice(0, 10),
-            till: now.toISOString().slice(0, 10),
+            till: till.toISOString().slice(0, 10),
             type: "factDate",
           },
         ],
