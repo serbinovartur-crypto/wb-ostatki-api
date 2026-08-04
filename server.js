@@ -465,8 +465,11 @@ async function appendDeductionLog(entry) {
 async function notifyNewUnresolved(sinceIso, pollerLabel) {
   try {
     const log = await loadJson("deduction_log", []);
+    // fetchError (не удалось прочитать /goods поставки — сбой на стороне WB,
+    // 0 шт списано) обрабатывается отдельно в runFboPoller с дедупликацией,
+    // сюда попадают только настоящие "товар/размер не распознан".
     const items = log.filter(function (e) {
-      return e.unresolved && e.ts && e.ts >= sinceIso;
+      return e.unresolved && !e.fetchError && e.ts && e.ts >= sinceIso;
     });
     if (!items.length) return;
     const lines = items.slice(0, 10).map(function (e) {
@@ -757,7 +760,12 @@ async function fetchFboSupplyGoods(supplyId) {
   const res = await fetch(WB_SUPPLIES_FBO_URL + "/" + supplyId + "/goods?limit=1000&offset=0", {
     headers: { Authorization: WB_API_TOKEN },
   });
-  if (!res.ok) throw new Error("supplies-api /goods " + res.status + ": " + (await res.text().catch(() => "")));
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    const err = new Error("supplies-api /goods " + res.status + ": " + text);
+    err.status = res.status;
+    throw err;
+  }
   return await res.json();
 }
 
@@ -768,6 +776,15 @@ async function runFboPoller() {
     const supplies = await fetchAllFboSupplies();
     const acceptedState = await loadJson("fbo_accepted_state", {});
     const skuMap = await loadJson("sku_product_map", {});
+    // Дедупликация уведомлений об ошибках чтения /goods по конкретной поставке:
+    // WB иногда на несколько часов роняет этот метод (500/503) для одних и тех
+    // же старых поставок при каждом прогоне (раз в 10 минут) — без этого была
+    // бы серия из десятка одинаковых по сути алертов подряд. Помним последнюю
+        // "версию" ошибки (код статуса) на поставку; шлём заново только если
+    // поставка успешно прочиталась (ошибка ушла), а потом снова не читается,
+    // или если код ошибки поменялся.
+    const fetchAlertState = await loadJson("fbo_fetch_alert_state", {});
+    const newFetchErrors = []; // [{supplyId, status}]
 
     const supplySummaries = {}; // supplyId -> qty списано
 
@@ -779,13 +796,21 @@ async function runFboPoller() {
       let goods;
       try {
         goods = await fetchFboSupplyGoods(supplyId);
+        if (fetchAlertState[String(supplyId)]) delete fetchAlertState[String(supplyId)];
       } catch (e) {
+        const marker = "status:" + (e.status || "unknown");
         await appendDeductionLog({
           source: "fbo",
           supplyId: supplyId,
           unresolved: true,
+          fetchError: true,
+          httpStatus: e.status || null,
           note: "не удалось получить товары поставки (/goods): " + e.message,
         });
+        if (fetchAlertState[String(supplyId)] !== marker) {
+          newFetchErrors.push({ supplyId: supplyId, status: e.status || "?" });
+          fetchAlertState[String(supplyId)] = marker;
+        }
         continue;
       }
       const list = Array.isArray(goods) ? goods : goods.goods || [];
@@ -812,6 +837,7 @@ async function runFboPoller() {
       }
     }
     await saveJson("fbo_accepted_state", acceptedState);
+    await saveJson("fbo_fetch_alert_state", fetchAlertState);
     await recordPollerHealth("fbo", true);
 
     const supplyIds = Object.keys(supplySummaries);
@@ -821,6 +847,20 @@ async function runFboPoller() {
       });
       await sendTelegram("✅ ФБО принято на складе ВБ, остатки списаны:\n" + lines.join("\n"));
     }
+
+    if (newFetchErrors.length) {
+      const lines = newFetchErrors.slice(0, 10).map(function (f) {
+        return "• Поставка " + f.supplyId + " (ошибка " + f.status + ")";
+      });
+      let text =
+        "ℹ️ ФБО: не смог проверить " + newFetchErrors.length +
+        " поставк" + (newFetchErrors.length === 1 ? "у" : "и") +
+        " из-за временного сбоя на стороне Wildberries. Списано 0 шт, на остатки это не повлияло — повторю проверку в следующий раз.\n" +
+        lines.join("\n");
+      if (newFetchErrors.length > 10) text += "\n…и ещё " + (newFetchErrors.length - 10) + ".";
+      await sendTelegram(text);
+    }
+
     await notifyNewUnresolved(runStartedAt, "ФБО");
   } catch (e) {
     console.error("FBO poller error:", e.message);
@@ -1033,7 +1073,7 @@ app.post("/api/competitors", requireApiKey, async (req, res) => {
       url: "https://www.wildberries.ru/catalog/" + nmID + "/detail.aspx",
       name: (name || "").trim() || ("Конкурент " + nmID),
       addedAt: new Date().toISOString(),
-    active: true,
+      active: true,
     };
     list.push(item);
     await saveJson("competitors_list", list);
@@ -1062,17 +1102,14 @@ app.delete("/api/competitors/:id", requireApiKey, async (req, res) => {
   }
 });
 
-// Кнопка "Обновить" на сайте не может сама завести браузер и обойти
-// конкурента (это делает только Claude в чате) — она лишь ставит отметку
-// "проверить как можно скорее", чтобы запрос было видно и он не потерялся.
-// ÐÐºÐ»ÑÑÐ¸ÑÑ/Ð²ÑÐºÐ»ÑÑÐ¸ÑÑ ÐºÐ¾Ð½ÐºÑÑÐµÐ½ÑÐ° Ð±ÐµÐ· ÑÐ´Ð°Ð»ÐµÐ½Ð¸Ñ â Ð½ÐµÐ°ÐºÑÐ¸Ð²Ð½ÑÐµ Ð¿ÑÐ¾Ð¿ÑÑÐºÐ°ÑÑÑÑ Ð¿ÑÐ¸ Ð¼Ð°ÑÑÐ¾Ð²Ð¾Ð¼ Ð¾Ð±Ð½Ð¾Ð²Ð»ÐµÐ½Ð¸Ð¸
+// Включить/выключить конкурента без удаления — неактивные пропускаются при массовом обновлении
 app.post("/api/competitors/:id/active", requireApiKey, async (req, res) => {
   try {
     const { active } = req.body || {};
     const list = await loadJson("competitors_list", []);
     const idx = list.findIndex(function (c) { return c.id === req.params.id; });
     if (idx === -1) {
-      return res.status(404).json({ error: "ÐºÐ¾Ð½ÐºÑÑÐµÐ½Ñ Ñ ÑÐ°ÐºÐ¸Ð¼ qd Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½" });
+      return res.status(404).json({ error: "конкурент с таким id не найден" });
     }
     list[idx].active = active !== false;
     await saveJson("competitors_list", list);
@@ -1082,6 +1119,9 @@ app.post("/api/competitors/:id/active", requireApiKey, async (req, res) => {
   }
 });
 
+// Кнопка "Обновить" на сайте не может сама завести браузер и обойти
+// конкурента (это делает только Claude в чате) — она лишь ставит отметку
+// "проверить как можно скорее", чтобы запрос было видно и он не потерялся.
 app.post("/api/competitors/:id/request-refresh", async (req, res) => {
   try {
     const flags = await loadJson("competitor_refresh_requests", {});
