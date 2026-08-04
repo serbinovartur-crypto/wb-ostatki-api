@@ -981,6 +981,23 @@ app.get("/api/wb/supply-debug/:id", async (req, res) => {
   }
 });
 
+// Временный диагностический эндпоинт: проверяет, попадает ли конкретный ID
+// поставки в общий список fetchAllFboSupplies() (тот самый, который
+// использует поллер) — чтобы понять, видит ли поллер поставку вообще.
+app.get("/api/wb/supply-in-list/:id", async (req, res) => {
+  try {
+    const supplies = await fetchAllFboSupplies();
+    const id = String(req.params.id);
+    const found = supplies.find(function (s) {
+      const sid = s.id || s.ID || s.supplyID || s.incomeID;
+      return String(sid) === id;
+    });
+    res.json({ totalSupplies: supplies.length, found: !!found, entry: found || null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Ручной запуск (для проверки), требует X-Api-Key
 app.post("/api/deductions/run", requireApiKey, async (req, res) => {
   await runFbsPoller();
