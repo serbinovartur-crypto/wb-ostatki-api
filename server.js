@@ -959,6 +959,28 @@ app.get("/api/deductions/fbo/:limit", async (req, res) => {
   res.json({ total: entries.length, entries: entries.slice(-limit) });
 });
 
+// Временный диагностический эндпоинт: прямой запрос деталей конкретной
+// поставки у WB (в обход нашего списка/фильтра по датам) — чтобы понять,
+// почему поставка не попадает в обычный список /api/v1/supplies.
+app.get("/api/wb/supply-debug/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const detailRes = await fetch(WB_SUPPLIES_FBO_URL + "/" + id, {
+      headers: { Authorization: WB_API_TOKEN },
+    });
+    const detail = await detailRes.json().catch(() => null);
+    let goods = null;
+    try {
+      goods = await fetchFboSupplyGoods(id);
+    } catch (e) {
+      goods = { error: e.message };
+    }
+    res.json({ detailStatus: detailRes.status, detail: detail, goods: goods });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Ручной запуск (для проверки), требует X-Api-Key
 app.post("/api/deductions/run", requireApiKey, async (req, res) => {
   await runFbsPoller();
@@ -1274,12 +1296,36 @@ app.get("/api/competitors/:id/history", async (req, res) => {
   }
 });
 
+// Одноразовая (но безвредно повторяемая) подчистка: несколько старых ФБО-поставок
+// уже полностью разобраны вручную ещё в начале августа (см. откат лишних
+// списаний), но их /goods иногда отвечает ошибкой у WB — из-за этого они не
+// могли "устояться" сами (см. логику settled в runFboPoller) и продолжали
+// давать шумные алерты. Явно помечаем их устоявшимися один раз при старте,
+// дальше поллер их больше не трогает.
+async function bootstrapSettledFboSupplies() {
+  try {
+    const KNOWN_OLD_SUPPLIES = ["40151910", "40298885", "40755615", "39927994", "40868998", "41153512"];
+    const settledState = await loadJson("fbo_settled_supplies", {});
+    let changed = false;
+    for (const id of KNOWN_OLD_SUPPLIES) {
+      if (!settledState[id]) {
+        settledState[id] = new Date().toISOString();
+        changed = true;
+      }
+    }
+    if (changed) await saveJson("fbo_settled_supplies", settledState);
+  } catch (e) {
+    console.error("bootstrapSettledFboSupplies error:", e.message);
+  }
+}
+
 const PORT = process.env.PORT || 3000;
 
 ensureSchema()
   .then(() => {
     app.listen(PORT, () => console.log("wb-ostatki-api listening on " + PORT));
     if (WB_API_TOKEN) {
+      bootstrapSettledFboSupplies();
       refreshWbStockCache(); // сразу при старте сервиса
       refreshWbCardsCache();
       setInterval(refreshWbStockCache, 20 * 60 * 1000); // и затем каждые 20 минут
