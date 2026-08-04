@@ -483,9 +483,21 @@ async function notifyNewUnresolved(sinceIso, pollerLabel) {
   }
 }
 
+// WB иногда кладёт в techSize кириллические буквы, визуально неотличимые от
+// латинских (например, кириллическая "М" вместо латинской "M") — из-за этого
+// размер не распознавался, хотя выглядел абсолютно нормально на глаз.
+const CYRILLIC_LOOKALIKES = { М: "M", Х: "X", А: "A", С: "C", Е: "E", О: "O" };
+
 function normalizeSize(raw) {
   if (!raw) return null;
-  const up = String(raw).trim().toUpperCase();
+  let up = String(raw).trim().toUpperCase();
+  up = up
+    .split("")
+    .map(function (ch) {
+      return CYRILLIC_LOOKALIKES[ch] || ch;
+    })
+    .join("");
+  if (up === "2XL") up = "XXL"; // WB иногда пишет "2XL" вместо нашего "XXL"
   return OUR_SIZES.indexOf(up) !== -1 ? up : null;
 }
 
@@ -963,6 +975,38 @@ app.get("/api/deductions/fbo/:limit", async (req, res) => {
   const entries = log.filter((e) => e.source === "fbo");
   const limit = Number(req.params.limit) || entries.length;
   res.json({ total: entries.length, entries: entries.slice(-limit) });
+});
+
+// Временный эндпоинт: сбросить наш внутренний счётчик "уже видели" для
+// конкретных штрихкодов конкретной поставки. Нужен после починки нормализации
+// размера — те позиции, что раньше не распознались, уже "запомнены" как
+// увиденные (даже без реального списания), и поллер сам их не переберёт
+// повторно. Сброс заставляет поллер в следующий прогон снова посчитать их как
+// новые и списать по уже исправленной логике.
+app.get("/api/wb/reset-accepted/:supplyId", async (req, res) => {
+  try {
+    const barcodes = String(req.query.barcodes || "").split(",").map((s) => s.trim()).filter(Boolean);
+    const acceptedState = await loadJson("fbo_accepted_state", {});
+    const removed = [];
+    for (const bc of barcodes) {
+      const key = req.params.supplyId + ":" + bc;
+      if (acceptedState[key] !== undefined) {
+        delete acceptedState[key];
+        removed.push(key);
+      }
+    }
+    await saveJson("fbo_accepted_state", acceptedState);
+    // На всякий случай снимаем и с "устоявшихся" — вдруг успела settled-логика
+    // пометить эту поставку раньше времени.
+    const settledState = await loadJson("fbo_settled_supplies", {});
+    if (settledState[req.params.supplyId]) {
+      delete settledState[req.params.supplyId];
+      await saveJson("fbo_settled_supplies", settledState);
+    }
+    res.json({ ok: true, removed: removed });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Временный диагностический эндпоинт: прямой запрос деталей конкретной
