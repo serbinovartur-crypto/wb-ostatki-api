@@ -27,6 +27,28 @@ const pool = new Pool({
 
 const API_KEY = process.env.API_KEY || null;
 
+// Транзиентные сетевые сбои ("fetch failed") у WB API случаются регулярно и
+// сами проходят на следующем запросе. Раньше каждый такой одиночный сбой
+// приводил к сообщению в Telegram "ошибка" и через 5-15 минут — "исправлено",
+// то есть спаму на ровном месте. Оборачиваем все запросы к WB в пару быстрых
+// повторов перед тем как отдать ошибку наверх.
+const rawFetch = fetch;
+async function wbFetch(url, options, retries) {
+    retries = retries == null ? 2 : retries;
+    let lastErr;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+          try {
+                  return await rawFetch(url, options);
+          } catch (e) {
+                  lastErr = e;
+                  if (attempt < retries) {
+                            await new Promise(function (r) { setTimeout(r, 700 * (attempt + 1)); });
+                  }
+          }
+    }
+    throw lastErr;
+}
+
 // ---------------------------------------------------------------------------
 // Telegram-уведомления: бэкенд сам шлёт сообщения боту напрямую (не через
 // Claude), чтобы это работало независимо от того, открыто ли приложение Claude.
@@ -39,7 +61,7 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || null;
 async function sendTelegram(text) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
   try {
-    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    await wbFetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: text, parse_mode: "HTML" }),
@@ -132,7 +154,7 @@ async function fetchWbStocksFromWildberries() {
   const limit = 100000;
   let allItems = [];
   for (let page = 0; page < 10; page++) { // защита от бесконечного цикла
-    const res = await fetch(WB_STOCKS_URL, {
+    const res = await wbFetch(WB_STOCKS_URL, {
       method: "POST",
       headers: { Authorization: WB_API_TOKEN, "Content-Type": "application/json" },
       body: JSON.stringify({ limit, offset }),
@@ -209,7 +231,7 @@ const WB_STOCK_SIZES_URL = "https://seller-analytics-api.wildberries.ru/api/v2/s
 
 async function fetchWbWarehouses() {
   if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
-  const res = await fetch(WB_WAREHOUSES_URL, { headers: { Authorization: WB_API_TOKEN } });
+  const res = await wbFetch(WB_WAREHOUSES_URL, { headers: { Authorization: WB_API_TOKEN } });
   if (!res.ok) throw new Error("supplies-api /warehouses " + res.status + ": " + (await res.text().catch(() => "")));
   return await res.json();
 }
@@ -217,7 +239,7 @@ async function fetchWbWarehouses() {
 async function fetchRealStockForNm(nmID) {
   if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
   const today = new Date().toISOString().slice(0, 10);
-  const res = await fetch(WB_STOCK_SIZES_URL, {
+  const res = await wbFetch(WB_STOCK_SIZES_URL, {
     method: "POST",
     headers: { Authorization: WB_API_TOKEN, "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -297,7 +319,7 @@ async function fetchWbCardsFromWildberries() {
   let cursor = { limit: 100 };
   let allCards = [];
   for (let page = 0; page < 50; page++) { // защита от бесконечного цикла
-    const res = await fetch(WB_CARDS_URL, {
+    const res = await wbFetch(WB_CARDS_URL, {
       method: "POST",
       headers: { Authorization: WB_API_TOKEN, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -376,7 +398,7 @@ const WB_ORDERS_STAT_URL = "https://statistics-api.wildberries.ru/api/v1/supplie
 async function fetchWbOrdersStats(dateFromISO) {
   if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
   const url = WB_ORDERS_STAT_URL + "?dateFrom=" + encodeURIComponent(dateFromISO) + "&flag=0";
-  const res = await fetch(url, { headers: { Authorization: WB_API_TOKEN } });
+  const res = await wbFetch(url, { headers: { Authorization: WB_API_TOKEN } });
   if (!res.ok) throw new Error("statistics-api /orders " + res.status + ": " + (await res.text().catch(() => "")));
   return await res.json();
 }
@@ -592,7 +614,7 @@ async function fetchAllFbsSupplies() {
   let next = 0;
   let all = [];
   for (let page = 0; page < 50; page++) {
-    const res = await fetch(WB_MARKETPLACE_SUPPLIES_URL + "?limit=1000&next=" + next, {
+    const res = await wbFetch(WB_MARKETPLACE_SUPPLIES_URL + "?limit=1000&next=" + next, {
       headers: { Authorization: WB_API_TOKEN },
     });
     if (!res.ok) throw new Error("marketplace-api /supplies " + res.status + ": " + (await res.text().catch(() => "")));
@@ -610,7 +632,7 @@ async function fetchFbsOrdersInWindow(dateFrom, dateTo) {
   let all = [];
   for (let page = 0; page < 50; page++) {
     const url = WB_MARKETPLACE_ORDERS_URL + "?limit=1000&next=" + next + "&dateFrom=" + dateFrom + "&dateTo=" + dateTo;
-    const res = await fetch(url, { headers: { Authorization: WB_API_TOKEN } });
+    const res = await wbFetch(url, { headers: { Authorization: WB_API_TOKEN } });
     if (!res.ok) throw new Error("marketplace-api /orders " + res.status + ": " + (await res.text().catch(() => "")));
     const json = await res.json();
     const orders = json.orders || [];
@@ -629,7 +651,7 @@ async function recordPollerHealth(name, ok, errorMessage) {
   const health = await loadJson("poller_health", {});
   const now = new Date().toISOString();
   const prev = health[name] || { consecutiveErrors: 0 };
-  const wasHealthy = !prev.consecutiveErrors || prev.consecutiveErrors === 0;
+    const wasAlerted = (Number(prev.consecutiveErrors) || 0) >= 2;
   if (ok) {
     health[name] = {
       lastRunAt: now,
@@ -638,18 +660,19 @@ async function recordPollerHealth(name, ok, errorMessage) {
       lastErrorAt: prev.lastErrorAt || null,
       consecutiveErrors: 0,
     };
-    if (!wasHealthy) {
+        if (wasAlerted) {
       await sendTelegram("✅ " + name.toUpperCase() + ": ошибка устранена, поллер снова работает нормально.");
     }
   } else {
+        const consecutiveErrors = (Number(prev.consecutiveErrors) || 0) + 1;
     health[name] = {
       lastRunAt: now,
       lastSuccessAt: prev.lastSuccessAt || null,
       lastError: errorMessage,
       lastErrorAt: now,
-      consecutiveErrors: (Number(prev.consecutiveErrors) || 0) + 1,
+            consecutiveErrors: consecutiveErrors,
     };
-    if (wasHealthy) {
+        if (consecutiveErrors === 2) {
       await sendTelegram("⚠️ " + name.toUpperCase() + ": ошибка в работе поллера.\n" + errorMessage);
     }
   }
@@ -751,7 +774,7 @@ async function fetchAllFboSupplies() {
   const limit = 1000;
   let all = [];
   for (let page = 0; page < 20; page++) {
-    const res = await fetch(WB_SUPPLIES_FBO_URL + "?limit=" + limit + "&offset=" + offset, {
+    const res = await wbFetch(WB_SUPPLIES_FBO_URL + "?limit=" + limit + "&offset=" + offset, {
       method: "POST",
       headers: { Authorization: WB_API_TOKEN, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -777,7 +800,7 @@ async function fetchAllFboSupplies() {
 async function fetchFboSupplyGoods(supplyId) {
   let res;
   try {
-    res = await fetch(WB_SUPPLIES_FBO_URL + "/" + supplyId + "/goods?limit=1000&offset=0", {
+    res = await wbFetch(WB_SUPPLIES_FBO_URL + "/" + supplyId + "/goods?limit=1000&offset=0", {
       headers: { Authorization: WB_API_TOKEN },
     });
   } catch (e) {
@@ -1015,7 +1038,7 @@ app.get("/api/wb/reset-accepted/:supplyId", async (req, res) => {
 app.get("/api/wb/supply-debug/:id", async (req, res) => {
   try {
     const id = req.params.id;
-    const detailRes = await fetch(WB_SUPPLIES_FBO_URL + "/" + id, {
+    const detailRes = await wbFetch(WB_SUPPLIES_FBO_URL + "/" + id, {
       headers: { Authorization: WB_API_TOKEN },
     });
     const detail = await detailRes.json().catch(() => null);
@@ -1093,7 +1116,7 @@ const WB_ADV_ACTIVE_STATUS = 9; // по документации WB API: 9 = к�
 async function fetchActiveRecommendationNmIds() {
   if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
 
-  const countRes = await fetch(WB_ADV_COUNT_URL, {
+  const countRes = await wbFetch(WB_ADV_COUNT_URL, {
     headers: { Authorization: WB_API_TOKEN },
   });
   if (!countRes.ok) {
@@ -1113,7 +1136,7 @@ async function fetchActiveRecommendationNmIds() {
   for (let i = 0; i < activeAdvertIds.length; i += 50) {
     const batch = activeAdvertIds.slice(i, i + 50);
     const url = WB_ADV_ADVERTS_URL + "?ids=" + batch.join(",");
-    const res = await fetch(url, { headers: { Authorization: WB_API_TOKEN } });
+    const res = await wbFetch(url, { headers: { Authorization: WB_API_TOKEN } });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       throw new Error("WB Adv API (adverts) ответил " + res.status + ": " + text);
@@ -1150,7 +1173,7 @@ const WB_FBS_STOCKS_URL = "https://marketplace-api.wildberries.ru/api/v3/stocks"
 
 async function fetchFbsWarehouses() {
     if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
-    const res = await fetch(WB_FBS_WAREHOUSES_URL, { headers: { Authorization: WB_API_TOKEN } });
+    const res = await wbFetch(WB_FBS_WAREHOUSES_URL, { headers: { Authorization: WB_API_TOKEN } });
     if (!res.ok) throw new Error("marketplace-api /warehouses " + res.status + ": " + (await res.text().catch(() => "")));
     const json = await res.json();
     return Array.isArray(json) ? json : (json.warehouses || []);
@@ -1162,7 +1185,7 @@ async function fetchFbsStocksForWarehouse(warehouseId, skus) {
     for (let i = 0; i < skus.length; i += 1000) {
           const batch = skus.slice(i, i + 1000);
           if (!batch.length) continue;
-          const res = await fetch(WB_FBS_STOCKS_URL + "/" + warehouseId, {
+          const res = await wbFetch(WB_FBS_STOCKS_URL + "/" + warehouseId, {
                   method: "POST",
                   headers: { Authorization: WB_API_TOKEN, "Content-Type": "application/json" },
                   body: JSON.stringify({ skus: batch }),
