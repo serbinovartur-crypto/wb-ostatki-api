@@ -1170,34 +1170,48 @@ app.get("/api/ads/test", async (req, res) => {
 // показываем отдельной вкладкой на сайте.
 const WB_FBS_WAREHOUSES_URL = "https://marketplace-api.wildberries.ru/api/v3/warehouses";
 const WB_FBS_STOCKS_URL = "https://marketplace-api.wildberries.ru/api/v3/stocks";
+const WB_FBS_OFFICES_URL = "https://marketplace-api.wildberries.ru/api/v3/offices";
 
 async function fetchFbsWarehouses() {
-    if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
-    const res = await wbFetch(WB_FBS_WAREHOUSES_URL, { headers: { Authorization: WB_API_TOKEN } });
-    if (!res.ok) throw new Error("marketplace-api /warehouses " + res.status + ": " + (await res.text().catch(() => "")));
-    const json = await res.json();
-    return Array.isArray(json) ? json : (json.warehouses || []);
+  if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
+  const res = await wbFetch(WB_FBS_WAREHOUSES_URL, { headers: { Authorization: WB_API_TOKEN } });
+  if (!res.ok) throw new Error("marketplace-api /warehouses " + res.status + ": " + (await res.text().catch(() => "")));
+  const json = await res.json();
+  return Array.isArray(json) ? json : (json.warehouses || []);
+}
+
+// Список складов (СЦ) самого WB — нужен только чтобы подписать под именем
+// склада продавца, к какому физическому СЦ он привязан (продавец задаёт это
+// один раз через officeId при создании склада, см. POST /api/v3/warehouses).
+// Best-effort: если WB не отдаёт нужное поле или запрос падает — просто не
+// показываем подпись, на остальной функционал это не влияет.
+async function fetchFbsOffices() {
+  if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
+  const res = await wbFetch(WB_FBS_OFFICES_URL, { headers: { Authorization: WB_API_TOKEN } });
+  if (!res.ok) throw new Error("marketplace-api /offices " + res.status + ": " + (await res.text().catch(() => "")));
+  const json = await res.json();
+  return Array.isArray(json) ? json : (json.offices || []);
 }
 
 // skus — штрихкоды, не более 1000 за один запрос (лимит документации WB).
 async function fetchFbsStocksForWarehouse(warehouseId, skus) {
-    const result = {};
-    for (let i = 0; i < skus.length; i += 1000) {
-          const batch = skus.slice(i, i + 1000);
-          if (!batch.length) continue;
-          const res = await wbFetch(WB_FBS_STOCKS_URL + "/" + warehouseId, {
-                  method: "POST",
-                  headers: { Authorization: WB_API_TOKEN, "Content-Type": "application/json" },
-                  body: JSON.stringify({ skus: batch }),
-          });
-          if (!res.ok) throw new Error("marketplace-api /stocks " + res.status + ": " + (await res.text().catch(() => "")));
-          const json = await res.json();
-          const stocks = (json && json.stocks) || [];
-          stocks.forEach(function (s) {
-                  result[String(s.sku)] = Number(s.amount) || 0;
-          });
-    }
-    return result;
+  const result = {};
+  for (let i = 0; i < skus.length; i += 1000) {
+    const batch = skus.slice(i, i + 1000);
+    if (!batch.length) continue;
+    const res = await wbFetch(WB_FBS_STOCKS_URL + "/" + warehouseId, {
+      method: "POST",
+      headers: { Authorization: WB_API_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({ skus: batch }),
+    });
+    if (!res.ok) throw new Error("marketplace-api /stocks " + res.status + ": " + (await res.text().catch(() => "")));
+    const json = await res.json();
+    const stocks = (json && json.stocks) || [];
+    stocks.forEach(function (s) {
+      result[String(s.sku)] = Number(s.amount) || 0;
+    });
+  }
+  return result;
 }
 
 // Собирает и кэширует текущий остаток ФБС по каждому товару+размеру (сумма
@@ -1206,123 +1220,152 @@ async function fetchFbsStocksForWarehouse(warehouseId, skus) {
 // которым уже пользуются ФБС/ФБО-поллеры списаний, отдельно ходить в Content
 // API не нужно.
 async function refreshFbsStockCache() {
+  try {
+    const warehouses = await fetchFbsWarehouses();
+    if (!warehouses.length) throw new Error("у продавца не настроено ни одного склада ФБС в личном кабинете WB");
+
+    // СЦ (офис WB), к которому привязан склад продавца — best-effort, не
+    // должно ронять весь рефреш остатков, если WB не отдаёт нужное поле.
+    let officesById = {};
     try {
-          const warehouses = await fetchFbsWarehouses();
-          if (!warehouses.length) throw new Error("у продавца не настроено ни одного склада ФБС в личном кабинете WB");
-          const cardsCache = await loadJson("wb_cards_cache", { cards: [] });
-      
-          const allSkus = new Set();
-          (cardsCache.cards || []).forEach(function (c) {
-                  (c.sizes || []).forEach(function (s) {
-                            (s.skus || []).forEach(function (sku) { allSkus.add(String(sku)); });
-                  });
-          });
-          const skuList = Array.from(allSkus);
-      
-          const byWarehouse = {}; // warehouseId -> { sku: amount }
-          for (const wh of warehouses) {
-                  byWarehouse[wh.id] = await fetchFbsStocksForWarehouse(wh.id, skuList);
-          }
-      
-          const rows = [];
-          (cardsCache.cards || []).forEach(function (c) {
-                  (c.sizes || []).forEach(function (s) {
-                            const skus = s.skus || [];
-                            if (!skus.length) return;
-                            let total = 0;
-                            const perWarehouse = {};
-                            warehouses.forEach(function (wh) {
-                                        let whTotal = 0;
-                                        skus.forEach(function (sku) {
-                                                      whTotal += (byWarehouse[wh.id] && byWarehouse[wh.id][String(sku)]) || 0;
-                                        });
-                                        perWarehouse[wh.id] = whTotal;
-                                        total += whTotal;
-                            });
-                            rows.push({
-                                        nmID: c.nmID,
-                                        vendorCode: c.vendorCode,
-                                        title: c.title,
-                                        photo: c.photo,
-                                        techSize: s.techSize,
-                                        totalAmount: total,
-                                        byWarehouse: perWarehouse,
-                            });
-                  });
-          });
-      
-          const snapshot = {
-                  fetchedAt: new Date().toISOString(),
-                  warehouses: warehouses.map(function (w) { return { id: w.id, name: w.name }; }),
-                  rows: rows,
-                  error: null,
-          };
-          await saveJson("fbs_stock_cache", snapshot);
-          console.log("FBS stock cache refreshed:", rows.length, "rows");
-          await recordPollerHealth("fbs_stock", true);
-          await checkFbsStockAlerts(rows);
+      const offices = await fetchFbsOffices();
+      offices.forEach(function (o) {
+        const name = o.name || o.officeName || o.title || "";
+        if (o.id != null && name) officesById[String(o.id)] = name;
+      });
     } catch (e) {
-          console.error("Failed to refresh FBS stock cache:", e.message);
-          await recordPollerHealth("fbs_stock", false, e.message);
+      console.warn("Не удалось получить список офисов WB (СЦ):", e.message);
     }
+    const officeOverrides = await loadJson("fbs_warehouse_office_override", {});
+
+    const cardsCache = await loadJson("wb_cards_cache", { cards: [] });
+
+    const allSkus = new Set();
+    (cardsCache.cards || []).forEach(function (c) {
+      (c.sizes || []).forEach(function (s) {
+        (s.skus || []).forEach(function (sku) { allSkus.add(String(sku)); });
+      });
+    });
+    const skuList = Array.from(allSkus);
+
+    const byWarehouse = {}; // warehouseId -> { sku: amount }
+    for (const wh of warehouses) {
+      byWarehouse[wh.id] = await fetchFbsStocksForWarehouse(wh.id, skuList);
+    }
+
+    const rows = [];
+    (cardsCache.cards || []).forEach(function (c) {
+      (c.sizes || []).forEach(function (s) {
+        const skus = s.skus || [];
+        if (!skus.length) return;
+        let total = 0;
+        const perWarehouse = {};
+        warehouses.forEach(function (wh) {
+          let whTotal = 0;
+          skus.forEach(function (sku) {
+            whTotal += (byWarehouse[wh.id] && byWarehouse[wh.id][String(sku)]) || 0;
+          });
+          perWarehouse[wh.id] = whTotal;
+          total += whTotal;
+        });
+        rows.push({
+          nmID: c.nmID,
+          vendorCode: c.vendorCode,
+          title: c.title,
+          photo: c.photo,
+          techSize: s.techSize,
+          totalAmount: total,
+          byWarehouse: perWarehouse,
+        });
+      });
+    });
+
+    const snapshot = {
+      fetchedAt: new Date().toISOString(),
+      warehouses: warehouses.map(function (w) {
+        const officeId = w.officeId != null ? w.officeId : (w.office && w.office.id != null ? w.office.id : null);
+        const autoName = officeId != null ? officesById[String(officeId)] : null;
+        const overrideName = officeOverrides[String(w.id)];
+        return { id: w.id, name: w.name, officeId: officeId, officeName: overrideName || autoName || null };
+      }),
+      rows: rows,
+      error: null,
+    };
+    await saveJson("fbs_stock_cache", snapshot);
+    console.log("FBS stock cache refreshed:", rows.length, "rows");
+    await recordPollerHealth("fbs_stock", true);
+    await checkFbsStockAlerts(rows, snapshot.warehouses);
+  } catch (e) {
+    console.error("Failed to refresh FBS stock cache:", e.message);
+    await recordPollerHealth("fbs_stock", false, e.message);
+  }
 }
 
 // Уведомления о заканчивающихся "важных" (отмеченных галочкой) артикулах.
 // Порог — один общий для всех (ключ app_state "fbs_watch_threshold"), список
-// отмеченных — "fbs_watch" ({ "nmID|techSize": true }), уровень отслеживания —
-// товар+размер отдельно. Оба ключа пишутся с сайта через уже существующий
-// общий PUT /api/state/:key, отдельные эндпоинты для них не нужны. Шлём в
-// Telegram только на переходе через порог (вниз — один раз, вверх после
-// дозаказа — один раз), чтобы не спамить одним и тем же при каждой проверке.
-async function checkFbsStockAlerts(rows) {
-    const watch = await loadJson("fbs_watch", {});
-    const watchedKeys = Object.keys(watch).filter(function (k) { return watch[k]; });
-    if (!watchedKeys.length) return;
-  
-    const threshold = Number(await loadJson("fbs_watch_threshold", 5)) || 0;
-    const alertState = await loadJson("fbs_watch_alert_state", {});
-    const rowsByKey = {};
-    rows.forEach(function (r) { rowsByKey[r.nmID + "|" + r.techSize] = r; });
-  
-    const lowNow = [];
-    const recovered = [];
-    let changed = false;
-  
-    for (const key of watchedKeys) {
-          const row = rowsByKey[key];
-          const amount = row ? row.totalAmount : 0;
-          const wasAlerted = !!alertState[key];
-          if (amount <= threshold) {
-                  if (!wasAlerted) {
-                            alertState[key] = true;
-                            changed = true;
-                            lowNow.push({ key: key, row: row, amount: amount });
-                  }
-          } else if (wasAlerted) {
-                  delete alertState[key];
-                  changed = true;
-                  recovered.push({ key: key, row: row, amount: amount });
-          }
+// отмеченных — "fbs_watch" ({ "nmID|techSize|warehouseId": true }), уровень
+// отслеживания — товар+размер+КОНКРЕТНЫЙ СКЛАД (не сумма по складам), потому
+// что на сайте теперь отдельная вкладка на каждый склад продавца и галочка
+// "Важно" ставится в рамках одной вкладки. Оба ключа app_state пишутся с
+// сайта через уже существующий общий PUT /api/state/:key, отдельные
+// эндпоинты не нужны. Шлём в Telegram только на переходе через порог (вниз —
+// один раз, вверх после дозаказа — один раз), чтобы не спамить одним и тем
+// же при каждой проверке.
+async function checkFbsStockAlerts(rows, warehouses) {
+  const watch = await loadJson("fbs_watch", {});
+  const watchedKeys = Object.keys(watch).filter(function (k) { return watch[k]; });
+  if (!watchedKeys.length) return;
+
+  const threshold = Number(await loadJson("fbs_watch_threshold", 5)) || 0;
+  const alertState = await loadJson("fbs_watch_alert_state", {});
+  const rowsByKey = {};
+  rows.forEach(function (r) { rowsByKey[r.nmID + "|" + r.techSize] = r; });
+  const warehouseNameById = {};
+  (warehouses || []).forEach(function (w) { warehouseNameById[String(w.id)] = w.name; });
+
+  const lowNow = [];
+  const recovered = [];
+  let changed = false;
+
+  for (const key of watchedKeys) {
+    const parts = key.split("|");
+    const nmSizeKey = parts[0] + "|" + parts[1];
+    const warehouseId = parts[2];
+    const row = rowsByKey[nmSizeKey];
+    const amount = row && row.byWarehouse ? (Number(row.byWarehouse[warehouseId]) || 0) : 0;
+    const warehouseName = warehouseNameById[warehouseId] || ("склад #" + warehouseId);
+    const wasAlerted = !!alertState[key];
+    if (amount <= threshold) {
+      if (!wasAlerted) {
+        alertState[key] = true;
+        changed = true;
+        lowNow.push({ key: key, row: row, amount: amount, warehouseName: warehouseName });
+      }
+    } else if (wasAlerted) {
+      delete alertState[key];
+      changed = true;
+      recovered.push({ key: key, row: row, amount: amount, warehouseName: warehouseName });
     }
-  
-    if (changed) await saveJson("fbs_watch_alert_state", alertState);
-  
-    if (lowNow.length) {
-          const lines = lowNow.map(function (x) {
-                  const title = x.row ? (x.row.title || x.row.vendorCode || x.key) : x.key;
-                  const size = x.row ? x.row.techSize : "";
-                  return "• " + title + ", размер " + size + " — осталось " + x.amount + " шт";
-          });
-          await sendTelegram("⚠️ Заканчивается остаток по ФБС (порог " + threshold + " шт):\n" + lines.join("\n"));
-    }
-    if (recovered.length) {
-          const lines = recovered.map(function (x) {
-                  const title = x.row ? (x.row.title || x.row.vendorCode || x.key) : x.key;
-                  const size = x.row ? x.row.techSize : "";
-                  return "• " + title + ", размер " + size + " — снова " + x.amount + " шт";
-          });
-          await sendTelegram("✅ Остаток по ФБС пополнен выше порога:\n" + lines.join("\n"));
-    }
+  }
+
+  if (changed) await saveJson("fbs_watch_alert_state", alertState);
+
+  if (lowNow.length) {
+    const lines = lowNow.map(function (x) {
+      const title = x.row ? (x.row.title || x.row.vendorCode || x.key) : x.key;
+      const size = x.row ? x.row.techSize : "";
+      return "• " + title + ", размер " + size + ", склад «" + x.warehouseName + "» — осталось " + x.amount + " шт";
+    });
+    await sendTelegram("⚠️ Заканчивается остаток по ФБС (порог " + threshold + " шт):\n" + lines.join("\n"));
+  }
+  if (recovered.length) {
+    const lines = recovered.map(function (x) {
+      const title = x.row ? (x.row.title || x.row.vendorCode || x.key) : x.key;
+      const size = x.row ? x.row.techSize : "";
+      return "• " + title + ", размер " + size + ", склад «" + x.warehouseName + "» — снова " + x.amount + " шт";
+    });
+    await sendTelegram("✅ Остаток по ФБС пополнен выше порога:\n" + lines.join("\n"));
+  }
 }
 
 // Отдаёт последний сохранённый снимок остатков ФБС (сайт всегда читает
