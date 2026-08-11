@@ -1352,17 +1352,19 @@ async function checkFbsStockAlerts(rows, warehouses) {
 
   if (lowNow.length) {
     const lines = lowNow.map(function (x) {
-      const title = x.row ? (x.row.title || x.row.vendorCode || x.key) : x.key;
+      // В уведомлении нужен артикул продавца (а не название товара) — так
+      // проще сразу понять, что искать в личном кабинете WB.
+      const vendorCode = x.row ? (x.row.vendorCode || x.row.title || x.key) : x.key;
       const size = x.row ? x.row.techSize : "";
-      return "• " + title + ", размер " + size + ", склад «" + x.warehouseName + "» — осталось " + x.amount + " шт";
+      return "• " + vendorCode + ", размер " + size + ", склад «" + x.warehouseName + "» — осталось " + x.amount + " шт";
     });
     await sendTelegram("⚠️ Заканчивается остаток по ФБС (порог " + threshold + " шт):\n" + lines.join("\n"));
   }
   if (recovered.length) {
     const lines = recovered.map(function (x) {
-      const title = x.row ? (x.row.title || x.row.vendorCode || x.key) : x.key;
+      const vendorCode = x.row ? (x.row.vendorCode || x.row.title || x.key) : x.key;
       const size = x.row ? x.row.techSize : "";
-      return "• " + title + ", размер " + size + ", склад «" + x.warehouseName + "» — снова " + x.amount + " шт";
+      return "• " + vendorCode + ", размер " + size + ", склад «" + x.warehouseName + "» — снова " + x.amount + " шт";
     });
     await sendTelegram("✅ Остаток по ФБС пополнен выше порога:\n" + lines.join("\n"));
   }
