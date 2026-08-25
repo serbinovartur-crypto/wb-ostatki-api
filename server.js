@@ -876,10 +876,12 @@ async function runFboPoller() {
       }
       const list = Array.isArray(goods) ? goods : goods.goods || [];
       let supplyDeltaTotal = 0;
+      let supplyAcceptedTotal = 0; // сумма ПРИНЯТОГО по всем позициям в этом прогоне
       for (const g of list) {
         const key = supplyId + ":" + g.barcode;
         const prevAccepted = Number(acceptedState[key]) || 0;
         const nowAccepted = Number(g.acceptedQuantity) || 0;
+        supplyAcceptedTotal += nowAccepted;
         const delta = nowAccepted - prevAccepted;
         if (delta > 0) {
           supplyDeltaTotal += delta;
@@ -898,9 +900,15 @@ async function runFboPoller() {
         }
         acceptedState[key] = nowAccepted;
       }
-      // Если поставку уже видели раньше (это не первый успешный прогон по ней)
-      // и в этот раз изменений ноль — считаем её устоявшейся и больше не трогаем.
-      if (seenState[String(supplyId)] && supplyDeltaTotal === 0) {
+      // Если поставку уже видели раньше (это не первый успешный прогон по ней),
+      // в этот раз изменений ноль, И при этом реально хоть что-то уже принято
+      // (supplyAcceptedTotal > 0) — считаем её устоявшейся и больше не трогаем.
+      // Условие "хоть что-то принято" — защита от бага: свежесозданная поставка,
+      // приёмку которой склад ещё не начал, тоже даёт "0 изменений" два прогона
+      // подряд, но это не значит "уже всё сделано", а значит "ещё не начали".
+      // Без этой проверки такая поставка помечалась устоявшейся навсегда, и
+      // реальное списание (когда приёмка позже всё-таки начиналась) терялось.
+      if (seenState[String(supplyId)] && supplyDeltaTotal === 0 && supplyAcceptedTotal > 0) {
         settledState[String(supplyId)] = new Date().toISOString();
       }
       seenState[String(supplyId)] = true;
