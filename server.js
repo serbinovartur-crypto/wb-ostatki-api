@@ -1040,6 +1040,30 @@ app.get("/api/wb/reset-accepted/:supplyId", async (req, res) => {
   }
 });
 
+// Временный эндпоинт: ручное списание остатка (например, по поставке на
+// маркетплейс, для которого ещё нет автоматического поллера — сейчас так
+// с Ozon, там пока нет ни токена, ни интеграции, только WB). Использует ту
+// же функцию deductUnits(), что и обычные ФБС/ФБО-списания: сначала берёт
+// из "Упакованные", если не хватает — из "Неупакованные", попадает в тот
+// же журнал списаний (/api/deductions), просто с другим source.
+app.get("/api/manual-deduct", async (req, res) => {
+  try {
+    const productName = String(req.query.product || "").trim();
+    const size = normalizeSize(req.query.size);
+    const qty = Number(req.query.qty);
+    if (!productName || !size || !qty || qty <= 0) {
+      return res.status(400).json({ error: "нужны query-параметры product, size (S/M/L/XL/XXL) и qty > 0" });
+    }
+    const result = await deductUnits(productName, size, qty, {
+      source: req.query.source || "manual",
+      note: req.query.note || null,
+    });
+    res.json({ ok: true, result: result });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Временный диагностический эндпоинт: прямой запрос деталей конкретной
 // поставки у WB (в обход нашего списка/фильтра по датам) — чтобы понять,
 // почему поставка не попадает в обычный список /api/v1/supplies.
