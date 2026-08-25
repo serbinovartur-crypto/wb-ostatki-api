@@ -1040,6 +1040,26 @@ app.get("/api/wb/reset-accepted/:supplyId", async (req, res) => {
   }
 });
 
+// Временный эндпоинт: добавить одну запись в sku_product_map (nmId -> имя
+// товара). Нужен для точечных правок сопоставления без похода в БД напрямую
+// (например, когда WB завёл новую карточку/nmId для уже существующего
+// товара, и автосписание ФБО падает как unresolved).
+app.get("/api/wb/map-sku", async (req, res) => {
+  try {
+    const nmId = String(req.query.nmId || "").trim();
+    const product = String(req.query.product || "").trim();
+    if (!nmId || !product) {
+      return res.status(400).json({ error: "нужны query-параметры nmId и product" });
+    }
+    const map = await loadJson("sku_product_map", {});
+    map[nmId] = product;
+    await saveJson("sku_product_map", map);
+    res.json({ ok: true, nmId: nmId, product: product });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Временный эндпоинт: ручное списание остатка (например, по поставке на
 // маркетплейс, для которого ещё нет автоматического поллера — сейчас так
 // с Ozon, там пока нет ни токена, ни интеграции, только WB). Использует ту
