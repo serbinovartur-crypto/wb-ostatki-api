@@ -1480,7 +1480,7 @@ app.get("/api/competitors", async (req, res) => {
 // Добавить конкурента вручную (по ссылке на его карточку товара на WB)
 app.post("/api/competitors", requireApiKey, async (req, res) => {
   try {
-    const { url, name } = req.body || {};
+    const { url, name, category } = req.body || {};
     const nmID = extractNmIdFromUrl(url);
     if (!nmID) {
       return res.status(400).json({
@@ -1495,6 +1495,7 @@ app.post("/api/competitors", requireApiKey, async (req, res) => {
       name: (name || "").trim() || ("Конкурент " + nmID),
       addedAt: new Date().toISOString(),
       active: true,
+      category: ["shirts", "hoodies", "other"].indexOf(category) !== -1 ? category : "shirts",
     };
     list.push(item);
     await saveJson("competitors_list", list);
@@ -1538,6 +1539,24 @@ app.post("/api/competitors/:id/active", requireApiKey, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// Изменить категорию конкурента (рубашки/худи/прочее) — для группировки на сайте
+app.post("/api/competitors/:id/category", requireApiKey, async (req, res) => {
+    try {
+          const { category } = req.body || {};
+          const allowed = ["shirts", "hoodies", "other"];
+          const list = await loadJson("competitors_list", []);
+          const idx = list.findIndex(function (c) { return c.id === req.params.id; });
+          if (idx === -1) {
+                  return res.status(404).json({ error: "конкурент с таким id не найден" });
+          }
+          list[idx].category = allowed.indexOf(category) !== -1 ? category : "shirts";
+          await saveJson("competitors_list", list);
+          res.json({ ok: true, competitor: list[idx] });
+    } catch (e) {
+          res.status(500).json({ error: e.message });
+    }
 });
 
 // Кнопка "Обновить" на сайте не может сама завести браузер и обойти
