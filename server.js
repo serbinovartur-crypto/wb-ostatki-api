@@ -1495,7 +1495,7 @@ app.post("/api/competitors", requireApiKey, async (req, res) => {
       name: (name || "").trim() || ("Конкурент " + nmID),
       addedAt: new Date().toISOString(),
       active: true,
-      category: ["shirts", "hoodies", "other"].indexOf(category) !== -1 ? category : "shirts",
+      category: ["shirts", "hoodies", "gloves", "other"].indexOf(category) !== -1 ? category : "shirts",
     };
     list.push(item);
     await saveJson("competitors_list", list);
@@ -1541,11 +1541,11 @@ app.post("/api/competitors/:id/active", requireApiKey, async (req, res) => {
   }
 });
 
-// Изменить категорию конкурента (рубашки/худи/прочее) — для группировки на сайте
+// Изменить категорию конкурента (рубашки/худи/перчатки/прочее) — для группировки на сайте
 app.post("/api/competitors/:id/category", requireApiKey, async (req, res) => {
     try {
           const { category } = req.body || {};
-          const allowed = ["shirts", "hoodies", "other"];
+          const allowed = ["shirts", "hoodies", "gloves", "other"];
           const list = await loadJson("competitors_list", []);
           const idx = list.findIndex(function (c) { return c.id === req.params.id; });
           if (idx === -1) {
