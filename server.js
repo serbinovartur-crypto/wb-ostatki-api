@@ -1648,15 +1648,24 @@ app.post("/api/competitors/:id/scan", requireApiKey, async (req, res) => {
     const day = date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : new Date().toISOString().slice(0, 10);
     const key = "competitor_scan_" + req.params.id;
     const data = await loadJson(key, { history: {} });
-    data.history[day] = {
+    if (!data.history) data.history = {};
+    if (!data.scans) data.scans = {};
+    const newScan = {
       scannedAt: new Date().toISOString(),
       totalSeen: items.length,
       matches: matches,
     };
+    // scans[day] — ВСЕ сканы за день по порядку (старые не затираем).
+    // Если за этот день раньше был один скан в старом формате (только
+    // history[day]) — переносим его в список первым.
+    if (!data.scans[day]) data.scans[day] = data.history[day] ? [data.history[day]] : [];
+    data.scans[day].push(newScan);
+    // history[day] — всегда ПОСЛЕДНИЙ скан дня (для сводки в списке конкурентов)
+    data.history[day] = newScan;
     // Не храним больше 90 дней истории по одному конкуренту, чтобы база не росла бесконечно
     const days = Object.keys(data.history).sort();
     if (days.length > 90) {
-      days.slice(0, days.length - 90).forEach(function (d) { delete data.history[d]; });
+      days.slice(0, days.length - 90).forEach(function (d) { delete data.history[d]; delete data.scans[d]; });
     }
     await saveJson(key, data);
 
