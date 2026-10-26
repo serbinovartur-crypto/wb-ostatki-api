@@ -1589,6 +1589,12 @@ app.get("/api/competitors/refresh-requests", async (req, res) => {
 app.post("/api/competitors/:id/scan", requireApiKey, async (req, res) => {
   try {
     const { items, date, competitorPhoto, competitorTitle } = req.body || {};
+    // Восстановление пропавшего скана задним числом: restored=true, scannedAt —
+    // примерное время, totalSeen — сколько карточек было в блоке (если известно).
+    const restored = (req.body || {}).restored === true;
+    const scannedAtIn = (req.body || {}).scannedAt && !isNaN(new Date(req.body.scannedAt).getTime())
+      ? new Date(req.body.scannedAt).toISOString() : null;
+    const totalSeenIn = (req.body || {}).totalSeen;
     if (!Array.isArray(items)) {
       return res.status(400).json({ error: "items должен быть массивом [{nmID, name, position}]" });
     }
@@ -1625,7 +1631,8 @@ app.post("/api/competitors/:id/scan", requireApiKey, async (req, res) => {
     // как null ("неизвестно"), а не false ("точно нет рекламы").
     let activeRecomNmIds = null;
     try {
-      activeRecomNmIds = await fetchActiveRecommendationNmIds();
+      // для восстановленного скана текущая реклама ничего не говорит о прошлом
+      if (!restored) activeRecomNmIds = await fetchActiveRecommendationNmIds();
     } catch (e) {
       console.error("не удалось получить активные рекламные кампании:", e.message);
     }
@@ -1651,17 +1658,19 @@ app.post("/api/competitors/:id/scan", requireApiKey, async (req, res) => {
     if (!data.history) data.history = {};
     if (!data.scans) data.scans = {};
     const newScan = {
-      scannedAt: new Date().toISOString(),
-      totalSeen: items.length,
+      scannedAt: scannedAtIn || new Date().toISOString(),
+      totalSeen: (totalSeenIn === null || typeof totalSeenIn === "number") && req.body.hasOwnProperty("totalSeen") ? totalSeenIn : items.length,
       matches: matches,
     };
+    if (restored) newScan.restored = true;
     // scans[day] — ВСЕ сканы за день по порядку (старые не затираем).
     // Если за этот день раньше был один скан в старом формате (только
     // history[day]) — переносим его в список первым.
     if (!data.scans[day]) data.scans[day] = data.history[day] ? [data.history[day]] : [];
     data.scans[day].push(newScan);
-    // history[day] — всегда ПОСЛЕДНИЙ скан дня (для сводки в списке конкурентов)
-    data.history[day] = newScan;
+    data.scans[day].sort(function (a, b) { return String(a.scannedAt).localeCompare(String(b.scannedAt)); });
+    // history[day] — всегда ПОСЛЕДНИЙ по времени скан дня (для сводки в списке конкурентов)
+    data.history[day] = data.scans[day][data.scans[day].length - 1];
     // Не храним больше 90 дней истории по одному конкуренту, чтобы база не росла бесконечно
     const days = Object.keys(data.history).sort();
     if (days.length > 90) {
