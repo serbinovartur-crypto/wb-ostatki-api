@@ -1203,6 +1203,50 @@ async function fetchActiveRecommendationNmIds() {
   return Array.from(nmIds);
 }
 
+// Снимок рекламы на момент скана: ВСЕ активные (статус 9) кампании, которые
+// касаются своих карточек: тип оплаты (cpm/cpc), режим (manual/unified),
+// где показывается (рекомендации/поиск) и ставки по карточкам в рублях.
+async function fetchAdsSnapshot(ownNmIds) {
+  if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан в переменных окружения");
+  const own = new Set((ownNmIds || []).map(Number));
+  const countRes = await wbFetch(WB_ADV_COUNT_URL, { headers: { Authorization: WB_API_TOKEN } });
+  if (!countRes.ok) throw new Error("WB Adv API (count) ответил " + countRes.status);
+  const countJson = await countRes.json();
+  const ids = [];
+  (countJson.adverts || []).forEach(function (g) {
+    if (g.status === WB_ADV_ACTIVE_STATUS) (g.advert_list || []).forEach(function (a) { ids.push(a.advertId); });
+  });
+  const campaigns = [];
+  for (let i = 0; i < ids.length; i += 50) {
+    const r = await wbFetch(WB_ADV_ADVERTS_URL + "?ids=" + ids.slice(i, i + 50).join(","), { headers: { Authorization: WB_API_TOKEN } });
+    if (!r.ok) throw new Error("WB Adv API (adverts) ответил " + r.status);
+    const j = await r.json();
+    (j.adverts || []).forEach(function (a) {
+      const bids = [];
+      (a.nm_settings || []).forEach(function (ns) {
+        if (!own.has(Number(ns.nm_id))) return;
+        const bk = ns.bids_kopecks || {};
+        bids.push({
+          nmID: Number(ns.nm_id),
+          rec: typeof bk.recommendations === "number" ? bk.recommendations / 100 : null,
+          search: typeof bk.search === "number" ? bk.search / 100 : null,
+        });
+      });
+      if (!bids.length) return;
+      const pl = (a.settings && a.settings.placements) || {};
+      campaigns.push({
+        id: a.id,
+        paymentType: a.settings && a.settings.payment_type || null,
+        bidType: a.bid_type || null,
+        recommendations: !!pl.recommendations,
+        search: !!pl.search,
+        bids: bids,
+      });
+    });
+  }
+  return { takenAt: new Date().toISOString(), campaigns: campaigns };
+}
+
 // Диагностический эндпоинт — только чтобы проверить, что у токена есть права
 // на раздел "Продвижение". После проверки можно убрать.
 app.get("/api/ads/test", async (req, res) => {
@@ -1688,6 +1732,16 @@ app.post("/api/competitors/:id/scan", requireApiKey, async (req, res) => {
     }
     const activeRecomSet = activeRecomNmIds ? new Set(activeRecomNmIds) : null;
 
+    // Снимок всех активных кампаний по своим карточкам (не для восстановленных сканов).
+    let adsSnapshot = null;
+    if (!restored) {
+      try {
+        adsSnapshot = await fetchAdsSnapshot(Object.keys(myCardsByNm));
+      } catch (e) {
+        console.error("не удалось получить снимок рекламы:", e.message);
+      }
+    }
+
     const matches = items
       .filter(function (it) { return it && myCardsByNm[String(it.nmID)]; })
       .map(function (it) {
@@ -1713,6 +1767,7 @@ app.post("/api/competitors/:id/scan", requireApiKey, async (req, res) => {
       matches: matches,
     };
     if (restored) newScan.restored = true;
+    if (adsSnapshot) newScan.adsSnapshot = adsSnapshot;
     // scans[day] — ВСЕ сканы за день по порядку (старые не затираем).
     // Если за этот день раньше был один скан в старом формате (только
     // history[day]) — переносим его в список первым.
@@ -1742,6 +1797,38 @@ app.post("/api/competitors/:id/scan", requireApiKey, async (req, res) => {
 });
 
 // История по конкретному конкуренту — для таблицы на сайте
+// Приписать снимок рекламы уже сохранённым сканам, у которых scannedAt
+// попадает в [from, to] (ISO). Body: {from, to, snapshot, overwrite?}
+app.post("/api/competitors/scans/attach-ads", requireApiKey, async (req, res) => {
+  try {
+    const { from, to, snapshot, overwrite } = req.body || {};
+    if (!from || !to || !snapshot || !Array.isArray(snapshot.campaigns)) {
+      return res.status(400).json({ error: "нужны from, to, snapshot.campaigns" });
+    }
+    const list = await loadJson("competitors_list", []);
+    let updated = 0;
+    for (const c of list) {
+      const key = "competitor_scan_" + c.id;
+      const data = await loadJson(key, null);
+      if (!data || !data.scans) continue;
+      let changed = false;
+      Object.keys(data.scans).forEach(function (d) {
+        data.scans[d].forEach(function (s) {
+          if (s.scannedAt >= from && s.scannedAt <= to && (overwrite || !s.adsSnapshot)) {
+            s.adsSnapshot = snapshot; changed = true; updated++;
+          }
+        });
+        const arr = data.scans[d];
+        if (arr.length) data.history[d] = arr[arr.length - 1];
+      });
+      if (changed) await saveJson(key, data);
+    }
+    res.json({ ok: true, updated: updated });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/api/competitors/:id/history", async (req, res) => {
   try {
     const key = "competitor_scan_" + req.params.id;
