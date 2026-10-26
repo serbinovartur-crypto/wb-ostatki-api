@@ -1214,6 +1214,56 @@ app.get("/api/ads/test", async (req, res) => {
   }
 });
 
+// Диагностика рекламы: СЫРЫЕ данные WB по кампаниям (тип, статус, размещения,
+// ставки), чтобы увидеть, что реально отдаёт токен. Ничего не меняет и не
+// сохраняет. ?statuses=9,11 — какие статусы брать (по умолчанию 9 и 11),
+// ?stats=1 — дополнительно пробуем статистику за сегодня/вчера.
+app.get("/api/ads/raw", requireApiKey, async (req, res) => {
+  const out = { ok: true };
+  try {
+    if (!WB_API_TOKEN) throw new Error("WB_API_TOKEN не задан");
+    const wanted = String(req.query.statuses || "9,11").split(",").map(Number);
+    const countRes = await wbFetch(WB_ADV_COUNT_URL, { headers: { Authorization: WB_API_TOKEN } });
+    const countText = await countRes.text();
+    out.countStatus = countRes.status;
+    let countJson = null;
+    try { countJson = JSON.parse(countText); } catch (e) { out.countRaw = countText.slice(0, 500); }
+    if (countJson) {
+      out.countSummary = (countJson.adverts || []).map(function (g) {
+        return { type: g.type, status: g.status, count: g.count, ids: (g.advert_list || []).map(function (a) { return a.advertId; }) };
+      });
+    }
+    const ids = [];
+    ((countJson && countJson.adverts) || []).forEach(function (g) {
+      if (wanted.indexOf(g.status) !== -1) (g.advert_list || []).forEach(function (a) { ids.push(a.advertId); });
+    });
+    out.idsFetched = ids;
+    out.adverts = [];
+    for (let i = 0; i < ids.length; i += 50) {
+      const r = await wbFetch(WB_ADV_ADVERTS_URL + "?ids=" + ids.slice(i, i + 50).join(","), { headers: { Authorization: WB_API_TOKEN } });
+      const t = await r.text();
+      if (!r.ok) { out.advertsError = r.status + ": " + t.slice(0, 500); break; }
+      try { out.adverts = out.adverts.concat(JSON.parse(t).adverts || []); } catch (e) { out.advertsError = "не JSON: " + t.slice(0, 300); }
+    }
+    if (req.query.stats === "1" && ids.length) {
+      try {
+        const d = new Date();
+        const end = d.toISOString().slice(0, 10);
+        const begin = new Date(d.getTime() - 86400000).toISOString().slice(0, 10);
+        const sr = await wbFetch("https://advert-api.wildberries.ru/adv/v3/fullstats?ids=" + ids.slice(0, 50).join(",") + "&beginDate=" + begin + "&endDate=" + end, { headers: { Authorization: WB_API_TOKEN } });
+        const st = await sr.text();
+        out.statsStatus = sr.status;
+        try { out.stats = JSON.parse(st); } catch (e) { out.statsRaw = st.slice(0, 800); }
+      } catch (e) { out.statsError = e.message; }
+    }
+    res.json(out);
+  } catch (e) {
+    out.ok = false;
+    out.error = e.message;
+    res.status(500).json(out);
+  }
+});
+
 // Остатки по ФБС (склад продавца) — Marketplace API, тот же WB_API_TOKEN
 // (категория "Маркетплейс" у него уже используется выше для /api/v3/supplies
 // и /api/v3/orders). В отличие от /api/wb/stock (это остатки НА СКЛАДАХ ВБ,
