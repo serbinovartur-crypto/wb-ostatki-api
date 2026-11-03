@@ -1247,6 +1247,27 @@ async function fetchAdsSnapshot(ownNmIds) {
   return { takenAt: new Date().toISOString(), campaigns: campaigns };
 }
 
+// Статистика рекламных кампаний за период (показы, клики, расход). Пример: /api/ads/stats?ids=41084042,41297442&begin=2026-11-01&end=2026-11-03
+app.get("/api/ads/stats", requireApiKey, async (req, res) => {
+  try {
+    const ids = String(req.query.ids || "").split(",").map(Number).filter(Boolean).slice(0, 50);
+    const begin = String(req.query.begin || "");
+    const end = String(req.query.end || "");
+    const okDate = /^\d{4}-\d{2}-\d{2}$/;
+    if (!ids.length || !okDate.test(begin) || !okDate.test(end)) {
+      return res.status(400).json({ ok: false, error: "нужны ids, begin, end (YYYY-MM-DD)" });
+    }
+    const url = "https://advert-api.wildberries.ru/adv/v3/fullstats?ids=" + ids.join(",") + "&beginDate=" + begin + "&endDate=" + end;
+    const sr = await wbFetch(url, { headers: { Authorization: WB_API_TOKEN } });
+    const text = await sr.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (e) {}
+    res.status(sr.ok ? 200 : 502).json({ ok: sr.ok, status: sr.status, stats: data, raw: data ? undefined : text.slice(0, 500) });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String((e && e.message) || e) });
+  }
+});
+
 // Диагностический эндпоинт — только чтобы проверить, что у токена есть права
 // на раздел "Продвижение". После проверки можно убрать.
 app.get("/api/ads/test", async (req, res) => {
