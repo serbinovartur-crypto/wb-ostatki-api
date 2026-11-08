@@ -524,7 +524,7 @@ function normalizeSize(raw) {
   if (OUR_SIZES.indexOf(up) !== -1) return up;
   // Перчатки: числовые размеры 9–13 (WB пишет "10,5" — приводим к "10.5")
   const gl = String(raw).trim().replace(",", ".");
-  if (GLOVE_SIZES.indexOf(gl) !== -1) return gl;
+  if (/^\d{1,2}(\.5)?$/.test(gl) && parseFloat(gl) >= 6 && parseFloat(gl) <= 16) return gl;
   return null;
 }
 
