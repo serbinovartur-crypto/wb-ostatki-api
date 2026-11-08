@@ -457,6 +457,7 @@ const WB_MARKETPLACE_SUPPLIES_URL = "https://marketplace-api.wildberries.ru/api/
 const WB_MARKETPLACE_ORDERS_URL = "https://marketplace-api.wildberries.ru/api/v3/orders";
 const WB_SUPPLIES_FBO_URL = "https://supplies-api.wildberries.ru/api/v1/supplies";
 const OUR_SIZES = ["S", "M", "L", "XL", "XXL"];
+const GLOVE_SIZES = ["9", "9.5", "10", "10.5", "11", "11.5", "12", "12.5", "13"];
 
 async function loadJson(key, fallback) {
   const { rows } = await pool.query("SELECT value FROM app_state WHERE key = $1", [key]);
@@ -520,7 +521,11 @@ function normalizeSize(raw) {
     })
     .join("");
   if (up === "2XL") up = "XXL"; // WB иногда пишет "2XL" вместо нашего "XXL"
-  return OUR_SIZES.indexOf(up) !== -1 ? up : null;
+  if (OUR_SIZES.indexOf(up) !== -1) return up;
+  // Перчатки: числовые размеры 9–13 (WB пишет "10,5" — приводим к "10.5")
+  const gl = String(raw).trim().replace(",", ".");
+  if (GLOVE_SIZES.indexOf(gl) !== -1) return gl;
+  return null;
 }
 
 function buildChrtIndex(cardsCache) {
