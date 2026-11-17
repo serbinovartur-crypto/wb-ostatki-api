@@ -51,6 +51,23 @@ module.exports = function initCompetitorsTable(deps) {
     return m;
   }
 
+  // Реклама из снимка, который сервер сохраняет в самом скане (adsSnapshot): только полки.
+  function fromScanSnapshot(snap, at) {
+    if (!snap || !at) return null;
+    const byNm = {};
+    (snap.campaigns || []).forEach(function (c) {
+      if (!c.recommendations) return;
+      const pt = String(c.paymentType || "").toLowerCase();
+      if (pt !== "cpm" && pt !== "cpc") return;
+      (c.bids || []).forEach(function (b) {
+        if (b.rec === null || b.rec === undefined) return;
+        const k = String(b.nmID);
+        (byNm[k] = byNm[k] || []).push({ t: pt.toUpperCase() + (c.bidType === "unified" ? " авто" : ""), bid: b.rec });
+      });
+    });
+    return { at: at, byNm: byNm };
+  }
+
   // Реклама на полках (рекомендации) у своих карточек в момент замера.
   // Берём последний снимок агента (ads_snapshots, раз в 30 мин) не позже момента замера.
   // Только активные кампании (status 9) с размещением «рекомендации»; поиск игнорируем.
@@ -112,11 +129,13 @@ module.exports = function initCompetitorsTable(deps) {
         if (!comps.length) continue;
         const rows = [];
         const seenNm = {};
+        let snapObj = null, snapAt = null;
         for (const c of comps) {
           const data = await loadJson("competitor_scan_" + c.id, { history: {}, scans: {} });
           const all = scansOf(data);
           const last = all.length ? all[all.length - 1] : null;
           const prev = all.length > 1 ? all[all.length - 2] : null;
+          if (last && last.adsSnapshot && (!snapAt || last.scannedAt > snapAt)) { snapAt = last.scannedAt; snapObj = last.adsSnapshot; }
           const pos = posMap(last);
           Object.keys(pos).forEach(function (k) { seenNm[k] = true; });
           rows.push({
@@ -137,8 +156,9 @@ module.exports = function initCompetitorsTable(deps) {
         }
         let tmax = null;
         rows.forEach(function (r) { if (r.scannedAt && (!tmax || r.scannedAt > tmax)) tmax = r.scannedAt; });
-        let ad = null;
-        try { ad = await adStateAt(tmax); } catch (e) { console.error("ad state:", e.message); }
+        // приоритет — снимок рекламы, сохранённый самим сканом (точно на момент замера)
+        let ad = fromScanSnapshot(snapObj, snapAt);
+        if (!ad) { try { ad = await adStateAt(tmax); } catch (e) { console.error("ad state:", e.message); } }
         result.push({ value: cat.value, label: cat.label, cards: colCards, rows: rows, ad: ad });
       }
       res.json({ categories: result, refreshRequests: flags, now: new Date().toISOString() });
