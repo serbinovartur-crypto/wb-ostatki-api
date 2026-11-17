@@ -243,6 +243,24 @@ module.exports = function initAdsAgent(deps) {
     });
     await saveJson("ads_snapshots", hist.slice(-300));
 
+    // почасовой ряд: накопленные за СЕГОДНЯ (МСК) показатели каждой кампании.
+    // WB отдаёт статистику только по дням, поэтому часовую картину получаем разностью соседних снимков.
+    try {
+      const today = mskDate(0);
+      const rows = [];
+      campaigns.forEach(function (c) {
+        if (!c.stats || c.stats.stale) return;
+        const d = (c.stats.days || []).find(function (x) { return x.date === today; }) || { views: 0, clicks: 0, spend: 0, atbs: 0, orders: 0 };
+        rows.push([c.id, d.views, d.clicks, d.spend, d.atbs, d.orders, c.budget ? c.budget.total : null, c.status,
+          (c.bids[0] ? c.bids[0].rec : null), (c.bids[0] ? c.bids[0].search : null)]);
+      });
+      if (rows.length) {
+        const series = await loadJson("ads_hourly", []);
+        series.push({ t: snapshot.takenAt, date: today, rows: rows });
+        await saveJson("ads_hourly", series.slice(-3000)); // ~60 суток при сборе раз в 30 мин
+      }
+    } catch (e) { errors.push("hourly: " + e.message); }
+
     return { takenAt: snapshot.takenAt, campaigns: campaigns.length, newEvents: events.length, errors: errors };
   }
 
@@ -345,6 +363,45 @@ module.exports = function initAdsAgent(deps) {
   });
 
   // Проверка, какие данные реально отдаёт токен (баланс, бюджет, воронка).
+  // Эффективность по часам суток (МСК): разность соседних снимков внутри одного дня.
+  // ?id=кампания (необязательно) &days=сколько суток назад (по умолчанию 14)
+  app.get("/api/ads/hourly", requireApiKey, async (req, res) => {
+    try {
+      const days = Math.min(Number(req.query.days) || 14, 60);
+      const onlyId = req.query.id ? Number(req.query.id) : null;
+      const since = Date.now() - days * 86400000;
+      const series = (await loadJson("ads_hourly", [])).filter(function (s) { return Date.parse(s.t) >= since; });
+      const out = {}; // id -> hour -> {spend, clicks, views, atbs, orders, bidSum, n}
+      for (let i = 1; i < series.length; i++) {
+        const a = series[i - 1], b = series[i];
+        if (a.date !== b.date) continue; // через полночь счётчик сбрасывается
+        const hour = new Date(Date.parse(b.t) + 3 * 3600 * 1000).getUTCHours(); // час МСК конца интервала
+        const prevRows = {};
+        a.rows.forEach(function (r) { prevRows[r[0]] = r; });
+        b.rows.forEach(function (r) {
+          const p = prevRows[r[0]];
+          if (!p || (onlyId && r[0] !== onlyId)) return;
+          const dv = r[1] - p[1], dc = r[2] - p[2], ds = r[3] - p[3], da = r[4] - p[4], dord = r[5] - p[5];
+          if (dv < 0 || ds < 0) return;
+          const o = out[r[0]] = out[r[0]] || {};
+          const h = o[hour] = o[hour] || { views: 0, clicks: 0, spend: 0, atbs: 0, orders: 0, intervals: 0, activeIntervals: 0 };
+          h.views += dv; h.clicks += dc; h.spend += ds; h.atbs += da; h.orders += dord; h.intervals++;
+          if (r[7] === 9) h.activeIntervals++;
+        });
+      }
+      Object.keys(out).forEach(function (id) {
+        Object.keys(out[id]).forEach(function (hr) {
+          const h = out[id][hr];
+          h.spend = Math.round(h.spend * 100) / 100;
+          h.ctr = h.views ? Math.round(h.clicks / h.views * 10000) / 100 : null;
+          h.cpc = h.clicks ? Math.round(h.spend / h.clicks * 100) / 100 : null;
+          h.costPerOrder = h.orders ? Math.round(h.spend / h.orders) : null;
+        });
+      });
+      res.json({ snapshots: series.length, from: series[0] && series[0].t, to: series.length && series[series.length - 1].t, byCampaignHourMsk: out });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   app.get("/api/ads/diag", requireApiKey, async (req, res) => {
     const out = {};
     try {
