@@ -51,6 +51,41 @@ module.exports = function initCompetitorsTable(deps) {
     return m;
   }
 
+  // Реклама на полках (рекомендации) у своих карточек в момент замера.
+  // Берём последний снимок агента (ads_snapshots, раз в 30 мин) не позже момента замера.
+  // Только активные кампании (status 9) с размещением «рекомендации»; поиск игнорируем.
+  // Результат кэшируем по времени замера, чтобы история не терялась, когда старые снимки удалятся.
+  async function adStateAt(isoTime) {
+    if (!isoTime) return null;
+    const cache = await loadJson("competitors_ad_state", {});
+    if (cache[isoTime]) return cache[isoTime];
+    const snaps = await loadJson("ads_snapshots", []);
+    const target = Date.parse(isoTime);
+    let best = null;
+    snaps.forEach(function (s) {
+      const t = Date.parse(s.takenAt);
+      if (!isNaN(t) && t <= target + 5 * 60 * 1000 && (!best || t > Date.parse(best.takenAt))) best = s;
+    });
+    if (!best || target - Date.parse(best.takenAt) > 60 * 60 * 1000) return null;
+    const byNm = {};
+    (best.campaigns || []).forEach(function (c) {
+      if (c.status !== 9) return;
+      const pt = String(c.paymentType || "").toLowerCase();
+      if (pt !== "cpm" && pt !== "cpc") return;
+      (c.bids || []).forEach(function (b) {
+        if (b[1] === null || b[1] === undefined) return; // нет ставки на рекомендации
+        const k = String(b[0]);
+        (byNm[k] = byNm[k] || []).push({ t: pt.toUpperCase(), bid: b[1] });
+      });
+    });
+    const out = { at: isoTime, snapshotAt: best.takenAt, byNm: byNm };
+    cache[isoTime] = out;
+    const keys = Object.keys(cache).sort();
+    while (keys.length > 500) delete cache[keys.shift()];
+    try { await deps.saveJson("competitors_ad_state", cache); } catch (e) { console.error("ad state save:", e.message); }
+    return out;
+  }
+
   app.get("/api/competitors/table", async function (req, res) {
     try {
       const list = await loadJson("competitors_list", []);
@@ -100,7 +135,11 @@ module.exports = function initCompetitorsTable(deps) {
             return { nmID: Number(k), vendorCode: c.vendorCode || String(k), label: c.vendorCode || String(k), photo: c.photo || null };
           });
         }
-        result.push({ value: cat.value, label: cat.label, cards: colCards, rows: rows });
+        let tmax = null;
+        rows.forEach(function (r) { if (r.scannedAt && (!tmax || r.scannedAt > tmax)) tmax = r.scannedAt; });
+        let ad = null;
+        try { ad = await adStateAt(tmax); } catch (e) { console.error("ad state:", e.message); }
+        result.push({ value: cat.value, label: cat.label, cards: colCards, rows: rows, ad: ad });
       }
       res.json({ categories: result, refreshRequests: flags, now: new Date().toISOString() });
     } catch (e) {
