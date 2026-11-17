@@ -1922,3 +1922,5 @@ ensureSchema()
     console.error("Failed to init schema", e);
     process.exit(1);
   });
+
+try { require("./ads-agent")({ app, wbFetch, requireApiKey, loadJson, saveJson, WB_API_TOKEN }); } catch (e) { console.error("ads-agent init failed:", e.message); }
