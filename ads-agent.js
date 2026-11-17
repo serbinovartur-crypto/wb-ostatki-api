@@ -152,6 +152,42 @@ module.exports = function initAdsAgent(deps) {
       errors.push("fullstats пропущен (лимит 1 запрос/мин)");
     }
 
+    // 6) воронка по карточкам (переходы → корзина → заказ → выкуп) за 7 дней и за вчера.
+    // Лимит WB — 3 запроса в минуту, поэтому всего два запроса за сбор.
+    const funnel = {};
+    try {
+      const nmIds = [];
+      campaigns.forEach(function (c) { c.bids.forEach(function (b) { if (nmIds.indexOf(b.nmID) === -1) nmIds.push(b.nmID); }); });
+      if (nmIds.length) {
+        const periods = [["d7", mskDate(7), mskDate(1)], ["d1", mskDate(1), mskDate(1)]];
+        for (const pr of periods) {
+          const f = await getJson(FUNNEL_URL, {
+            method: "POST",
+            headers: { Authorization: WB_API_TOKEN, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              selectedPeriod: { start: pr[1], end: pr[2] }, nmIds: nmIds.slice(0, 100), skipDeletedNm: true,
+              orderBy: { field: "openCard", mode: "desc" }, limit: 100, offset: 0,
+            }),
+          });
+          if (!f.ok || !f.json || !f.json.data) { errors.push("funnel " + pr[0] + " " + f.status + ": " + f.text); continue; }
+          (f.json.data.products || []).forEach(function (p) {
+            const nm = p.product && p.product.nmId;
+            const s = p.statistic && p.statistic.selected;
+            if (!nm || !s) return;
+            if (!funnel[nm]) funnel[nm] = { vendorCode: p.product.vendorCode || null };
+            const cv = s.conversions || {};
+            funnel[nm][pr[0]] = {
+              from: pr[1], to: pr[2],
+              open: s.openCount || 0, cart: s.cartCount || 0, orders: s.orderCount || 0, orderSum: s.orderSum || 0,
+              buyout: s.buyoutCount || 0, cancel: s.cancelCount || 0,
+              addToCartPct: num(cv.addToCartPercent), cartToOrderPct: num(cv.cartToOrderPercent), buyoutPct: num(cv.buyoutPercent),
+            };
+          });
+          await sleep(21000); // 3 запроса/мин
+        }
+      }
+    } catch (e) { errors.push("funnel: " + e.message); }
+
     // метрики не пришли — берём из прошлого снимка, чтобы не терять
     const prev = await loadJson("ads_overview_latest", null);
     if (prev && Array.isArray(prev.campaigns)) {
@@ -162,7 +198,7 @@ module.exports = function initAdsAgent(deps) {
       });
     }
 
-    const snapshot = { takenAt: new Date().toISOString(), balance: balance, campaigns: campaigns, errors: errors };
+    const snapshot = { takenAt: new Date().toISOString(), balance: balance, campaigns: campaigns, funnel: funnel, errors: errors };
     if (statsRaw && statsRaw[0]) snapshot.statsKeysSample = Object.keys(statsRaw[0]);
 
     // 6) журнал изменений
@@ -178,6 +214,10 @@ module.exports = function initAdsAgent(deps) {
     hist.push({
       takenAt: snapshot.takenAt,
       balance: balance,
+      funnel7: Object.keys(funnel).map(function (nm) {
+        const d = funnel[nm].d7 || {};
+        return [Number(nm), d.open, d.cart, d.orders, d.orderSum];
+      }),
       campaigns: campaigns.map(function (c) {
         return {
           id: c.id, status: c.status, paymentType: c.paymentType,
