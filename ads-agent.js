@@ -433,5 +433,9 @@ module.exports = function initAdsAgent(deps) {
     }, 30 * 60 * 1000);
   }, 2 * 60 * 1000);
 
+  // таблица позиций «свои карточки × конкуренты» для сайта (отдельный файл)
+  try { require("./competitors-table")({ app: app, loadJson: loadJson, saveJson: saveJson }); }
+  catch (e) { console.error("competitors-table init failed:", e.message); }
+
   console.log("ads-agent initialised");
 };
