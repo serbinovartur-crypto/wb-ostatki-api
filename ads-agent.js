@@ -100,6 +100,17 @@ module.exports = function initAdsAgent(deps) {
       await sleep(250);
     }
 
+    // Приоритет: активные кампании, затем недавно менявшиеся (за 30 дней).
+    // Остальные старые кампании на паузе остаются в снимке, но без бюджета/метрик.
+    const monthAgo = Date.now() - 30 * 86400000;
+    const isRelevant = function (c) {
+      return c.status === 9 || (c.updatedAt && Date.parse(c.updatedAt) >= monthAgo);
+    };
+    campaigns.sort(function (a, b) {
+      if ((a.status === 9) !== (b.status === 9)) return a.status === 9 ? -1 : 1;
+      return String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""));
+    });
+
     // 3) общий баланс кабинета
     let balance = null;
     try {
@@ -110,6 +121,7 @@ module.exports = function initAdsAgent(deps) {
 
     // 4) бюджет каждой кампании
     for (const c of campaigns) {
+      if (!isRelevant(c)) continue;
       try {
         const b = await getJson(BUDGET_URL + "?id=" + c.id);
         if (b.ok && b.json) c.budget = { cash: num(b.json.cash), netting: num(b.json.netting), total: num(b.json.total) };
@@ -120,10 +132,11 @@ module.exports = function initAdsAgent(deps) {
 
     // 5) статистика за последние 3 дня (у WB лимит 1 запрос в минуту)
     let statsRaw = null;
-    if (campaigns.length && Date.now() - lastStatsAt > 65 * 1000) {
+    const statsTargets = campaigns.filter(isRelevant).slice(0, 50);
+    if (statsTargets.length && Date.now() - lastStatsAt > 65 * 1000) {
       lastStatsAt = Date.now();
       try {
-        const s = await getJson(FULLSTATS_URL + "?ids=" + campaigns.map(function (c) { return c.id; }).slice(0, 50).join(",") +
+        const s = await getJson(FULLSTATS_URL + "?ids=" + statsTargets.map(function (c) { return c.id; }).join(",") +
           "&beginDate=" + mskDate(2) + "&endDate=" + mskDate(0));
         if (s.ok && Array.isArray(s.json)) {
           statsRaw = s.json;
