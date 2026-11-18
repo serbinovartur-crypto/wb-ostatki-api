@@ -243,6 +243,27 @@ module.exports = function initAdsAgent(deps) {
     });
     await saveJson("ads_snapshots", hist.slice(-300));
 
+    // дневной журнал: по каждой кампании и дню — расход и выручка с рекламы (ДРР считается из него).
+    // WB отдаёт данные только за последние дни, поэтому копим сами; день перезаписывается свежим значением.
+    try {
+      const daily = await loadJson("ads_daily", {});
+      campaigns.forEach(function (c) {
+        if (!c.stats || !c.stats.days) return;
+        c.stats.days.forEach(function (d) {
+          daily[d.date + "|" + c.id] = {
+            date: d.date, id: c.id, pt: c.paymentType,
+            nm: c.bids.map(function (b) { return b.nmID; }),
+            card: c.bids.map(function (b) { return b.vendorCode; }),
+            spend: d.spend, revenue: d.revenue, orders: d.orders, clicks: d.clicks, views: d.views, atbs: d.atbs,
+            updated: snapshot.takenAt,
+          };
+        });
+      });
+      const keys = Object.keys(daily).sort();
+      if (keys.length > 6000) keys.slice(0, keys.length - 6000).forEach(function (k) { delete daily[k]; });
+      await saveJson("ads_daily", daily);
+    } catch (e) { console.error("ads_daily error:", e.message); }
+
     // почасовой ряд: накопленные за СЕГОДНЯ (МСК) показатели каждой кампании.
     // WB отдаёт статистику только по дням, поэтому часовую картину получаем разностью соседних снимков.
     try {
@@ -425,6 +446,28 @@ module.exports = function initAdsAgent(deps) {
     } catch (e) { out.error = e.message; res.status(500).json(out); }
   });
 
+  // Что умеет токен WB (без показа самого токена): срок действия и набор прав из его содержимого.
+  // Расшифровываем только публичную часть JWT (без проверки подписи). Это справочная информация:
+  // «только чтение» определяем по биту 30 (по документации WB; на практике не проверено записью).
+  app.get("/api/ads/token-info", requireApiKey, function (req, res) {
+    try {
+      const parts = String(WB_API_TOKEN || "").split(".");
+      if (parts.length < 2) return res.json({ ok: false, error: "токен не похож на JWT" });
+      const payload = JSON.parse(Buffer.from(parts[1].replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
+      const s = Number(payload.s);
+      const bits = [];
+      for (let i = 0; i < 31; i++) { if (Math.floor(s / Math.pow(2, i)) % 2 === 1) bits.push(i); }
+      res.json({
+        ok: true,
+        expires: payload.exp ? new Date(payload.exp * 1000).toISOString() : null,
+        scopeBits: bits,
+        readOnlyBit30: bits.indexOf(30) !== -1,
+        test: payload.t === true,
+        payloadKeys: Object.keys(payload),
+      });
+    } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  });
+
   // ---- расписание: раз в 30 минут, чтобы журнал ловил изменения между сканами
   setTimeout(function () {
     safeCollect().catch(function (e) { console.error("ads-agent collect error:", e.message); });
@@ -434,7 +477,7 @@ module.exports = function initAdsAgent(deps) {
   }, 2 * 60 * 1000);
 
   // таблица позиций «свои карточки × конкуренты» для сайта (отдельный файл)
-  try { require("./competitors-table")({ app: app, loadJson: loadJson, saveJson: saveJson }); }
+  try { require("./competitors-table")({ app: app, loadJson: loadJson, saveJson: saveJson, requireApiKey: requireApiKey }); }
   catch (e) { console.error("competitors-table init failed:", e.message); }
 
   console.log("ads-agent initialised");

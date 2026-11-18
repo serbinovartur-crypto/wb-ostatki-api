@@ -9,6 +9,8 @@
 module.exports = function initCompetitorsTable(deps) {
   const app = deps.app;
   const loadJson = deps.loadJson;
+  // ключ API для эндпоинтов с данными рекламы (если ads-agent его передал)
+  const guard = deps.requireApiKey || function (req, res, next) { next(); };
 
   const CATEGORIES = [
     { value: "gloves", label: "Перчатки" },
@@ -187,7 +189,7 @@ module.exports = function initCompetitorsTable(deps) {
   // GET /api/ads/learning?days=30&category=gloves
   //   points:  по каждому замеру и своей карточке — тип/ставка рекламы на полках, средняя позиция у конкурентов, сколько конкурентов показали карточку
   //   summary: по каждой карточке и конфигурации рекламы — число замеров, средняя/мин/макс позиция
-  app.get("/api/ads/learning", async function (req, res) {
+  app.get("/api/ads/learning", guard, async function (req, res) {
     try {
       const days = Math.max(1, Math.min(120, Number(req.query.days) || 30));
       const category = String(req.query.category || "gloves");
@@ -248,6 +250,72 @@ module.exports = function initCompetitorsTable(deps) {
       res.json({ category: category, days: days, points: points, summary: summary });
     } catch (e) {
       console.error("ads learning error:", e.message);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // ДРР: расход на рекламу / выручка. Из дневного журнала ads_daily (копится агентом).
+  // GET /api/ads/drr?days=7
+  //   byCampaign: расход, выручка «с рекламы» (по данным рекламного кабинета), ДРР рекламы, CPC
+  //   byCard:     то же по карточке (только кампании с одной карточкой) + «общий ДРР» = расход / ВСЕ заказы карточки (воронка за те же даты)
+  app.get("/api/ads/drr", guard, async function (req, res) {
+    try {
+      const days = Math.max(1, Math.min(60, Number(req.query.days) || 7));
+      const daily = await loadJson("ads_daily", {});
+      const overview = await loadJson("ads_overview_latest", {});
+      const funnel = overview.funnel || {};
+      const cardsCache = await loadJson("wb_cards_cache", { cards: [] });
+      const vc = {};
+      (cardsCache.cards || []).forEach(function (c) { vc[String(c.nmID)] = c.vendorCode; });
+      const msk = new Date(Date.now() + 3 * 3600 * 1000);
+      const today = msk.toISOString().slice(0, 10);
+      const fromDate = new Date(msk.getTime() - (days - 1) * 86400000).toISOString().slice(0, 10);
+      const rows = Object.keys(daily).map(function (k) { return daily[k]; }).filter(function (r) { return r.date >= fromDate && r.date <= today; });
+      const pct = function (a, b) { return b > 0 ? Math.round(a / b * 1000) / 10 : null; };
+      const r2 = function (x) { return Math.round(x * 100) / 100; };
+
+      const camp = {};
+      rows.forEach(function (r) {
+        const c = camp[r.id] || (camp[r.id] = { id: r.id, type: r.pt, cards: r.card, nm: r.nm, spend: 0, revenue: 0, orders: 0, clicks: 0, views: 0, daysCount: 0 });
+        c.spend += r.spend || 0; c.revenue += r.revenue || 0; c.orders += r.orders || 0; c.clicks += r.clicks || 0; c.views += r.views || 0; c.daysCount++;
+      });
+      const byCampaign = Object.keys(camp).map(function (id) {
+        const c = camp[id];
+        return { id: c.id, type: c.type, cards: c.cards, spend: r2(c.spend), revenue: r2(c.revenue), orders: c.orders, clicks: c.clicks, cpc: c.clicks ? r2(c.spend / c.clicks) : null, drrAdsPct: pct(c.spend, c.revenue), days: c.daysCount };
+      }).filter(function (c) { return c.spend > 0 || c.revenue > 0; }).sort(function (a, b) { return b.spend - a.spend; });
+
+      // по карточкам (только однокарточные кампании); общий ДРР — по окну воронки d7
+      const card = {};
+      rows.forEach(function (r) {
+        if (!r.nm || r.nm.length !== 1) return;
+        const nm = String(r.nm[0]);
+        const c = card[nm] || (card[nm] = { nmID: Number(nm), card: vc[nm] || (r.card && r.card[0]) || nm, spend: 0, revenue: 0, orders: 0, spendInFunnelWindow: 0 });
+        c.spend += r.spend || 0; c.revenue += r.revenue || 0; c.orders += r.orders || 0;
+        const f = funnel[nm] && funnel[nm].d7;
+        if (f && f.from && f.to && r.date >= f.from && r.date <= f.to) c.spendInFunnelWindow += r.spend || 0;
+      });
+      const byCard = Object.keys(card).map(function (nm) {
+        const c = card[nm];
+        const f = funnel[nm] && funnel[nm].d7;
+        return {
+          nmID: c.nmID, card: c.card, spend: r2(c.spend), adRevenue: r2(c.revenue), adOrders: c.orders,
+          drrAdsPct: pct(c.spend, c.revenue),
+          funnelWindow: f ? { from: f.from || null, to: f.to || null } : null,
+          allOrdersSum: f && f.orderSum != null ? f.orderSum : null,
+          drrTotalPct: f && f.orderSum ? pct(c.spendInFunnelWindow, f.orderSum) : null,
+        };
+      }).sort(function (a, b) { return b.spend - a.spend; });
+
+      const byDay = {};
+      rows.forEach(function (r) {
+        const d = byDay[r.date] || (byDay[r.date] = { date: r.date, spend: 0, revenue: 0 });
+        d.spend += r.spend || 0; d.revenue += r.revenue || 0;
+      });
+      const dayList = Object.keys(byDay).sort().map(function (k) { const d = byDay[k]; return { date: d.date, spend: r2(d.spend), revenue: r2(d.revenue), drrAdsPct: pct(d.spend, d.revenue) }; });
+
+      res.json({ days: days, from: fromDate, to: today, journalDays: Object.keys(byDay).length, byDay: dayList, byCard: byCard, byCampaign: byCampaign });
+    } catch (e) {
+      console.error("ads drr error:", e.message);
       res.status(500).json({ error: e.message });
     }
   });
