@@ -913,7 +913,11 @@ async function runFboPoller() {
       // подряд, но это не значит "уже всё сделано", а значит "ещё не начали".
       // Без этой проверки такая поставка помечалась устоявшейся навсегда, и
       // реальное списание (когда приёмка позже всё-таки начиналась) терялось.
-      if (seenState[String(supplyId)] && supplyDeltaTotal === 0 && supplyAcceptedTotal > 0) {
+      // Дополнительная защита: WB иногда довносит приёмку спустя часы или сутки (Обухово, Казань
+      // в ноябре) — поставка, которую WB менял в последние 48 часов, "устоявшейся" не считается.
+      const lastTouch = Date.parse(supply.updatedDate || supply.factDate || supply.supplyDate || "");
+      const quietLongEnough = isNaN(lastTouch) ? true : Date.now() - lastTouch > 48 * 3600 * 1000;
+      if (seenState[String(supplyId)] && supplyDeltaTotal === 0 && supplyAcceptedTotal > 0 && quietLongEnough) {
         settledState[String(supplyId)] = new Date().toISOString();
       }
       seenState[String(supplyId)] = true;
