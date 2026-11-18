@@ -292,7 +292,10 @@ module.exports = function initCompetitorsTable(deps) {
         const c = card[nm] || (card[nm] = { nmID: Number(nm), card: vc[nm] || (r.card && r.card[0]) || nm, spend: 0, revenue: 0, orders: 0, spendInFunnelWindow: 0 });
         c.spend += r.spend || 0; c.revenue += r.revenue || 0; c.orders += r.orders || 0;
         const f = funnel[nm] && funnel[nm].d7;
-        if (f && f.from && f.to && r.date >= f.from && r.date <= f.to) c.spendInFunnelWindow += r.spend || 0;
+        if (f && f.from && f.to && r.date >= f.from && r.date <= f.to) {
+          c.spendInFunnelWindow += r.spend || 0;
+          (c.winDates || (c.winDates = {}))[r.date] = true;
+        }
       });
       const byCard = Object.keys(card).map(function (nm) {
         const c = card[nm];
@@ -302,7 +305,10 @@ module.exports = function initCompetitorsTable(deps) {
           drrAdsPct: pct(c.spend, c.revenue),
           funnelWindow: f ? { from: f.from || null, to: f.to || null } : null,
           allOrdersSum: f && f.orderSum != null ? f.orderSum : null,
-          drrTotalPct: f && f.orderSum ? pct(c.spendInFunnelWindow, f.orderSum) : null,
+          // общий ДРР считаем только если журнал покрывает все дни окна воронки (иначе расход занижен и ДРР вводит в заблуждение)
+          journalDaysInWindow: Object.keys(c.winDates || {}).length,
+          drrTotalPct: f && f.orderSum && f.from && f.to && Object.keys(c.winDates || {}).length >= Math.round((Date.parse(f.to) - Date.parse(f.from)) / 86400000) + 1
+            ? pct(c.spendInFunnelWindow, f.orderSum) : null,
         };
       }).sort(function (a, b) { return b.spend - a.spend; });
 
