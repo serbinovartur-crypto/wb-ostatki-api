@@ -183,5 +183,74 @@ module.exports = function initCompetitorsTable(deps) {
     }
   });
 
+  // «Память» агента: точки «реклама → позиция». Собирается из сохранённых замеров (ничего нового не пишет).
+  // GET /api/ads/learning?days=30&category=gloves
+  //   points:  по каждому замеру и своей карточке — тип/ставка рекламы на полках, средняя позиция у конкурентов, сколько конкурентов показали карточку
+  //   summary: по каждой карточке и конфигурации рекламы — число замеров, средняя/мин/макс позиция
+  app.get("/api/ads/learning", async function (req, res) {
+    try {
+      const days = Math.max(1, Math.min(120, Number(req.query.days) || 30));
+      const category = String(req.query.category || "gloves");
+      const since = Date.now() - days * 86400000;
+      const list = (await loadJson("competitors_list", [])).filter(function (c) { return (c.category || "shirts") === category && c.active !== false; });
+      const cardsCache = await loadJson("wb_cards_cache", { cards: [] });
+      const own = category === "gloves" ? glovesCards(cardsCache.cards || []) : [];
+      const labelByNm = {};
+      own.forEach(function (c) { labelByNm[String(c.nmID)] = c.label; });
+
+      const batches = {}; // key -> {t, byNm:{nm:[pos]}, comps:Set, snap}
+      for (const c of list) {
+        const data = await loadJson("competitor_scan_" + c.id, { history: {}, scans: {} });
+        scansOf(data).forEach(function (s) {
+          const t = Date.parse(s.scannedAt);
+          if (isNaN(t) || t < since || s.restored) return;
+          const key = String(Math.floor(t / (10 * 60 * 1000)));
+          const b = batches[key] || (batches[key] = { t: s.scannedAt, byNm: {}, comps: 0, snap: null });
+          if (s.scannedAt < b.t) b.t = s.scannedAt;
+          b.comps++;
+          if (!b.snap && s.adsSnapshot) b.snap = s.adsSnapshot;
+          (s.matches || []).forEach(function (m) {
+            if (m.position == null) return;
+            (b.byNm[String(m.nmID)] = b.byNm[String(m.nmID)] || []).push(m.position);
+          });
+        });
+      }
+
+      const points = [];
+      Object.keys(batches).sort().forEach(function (k) {
+        const b = batches[k];
+        if (!b.snap || b.comps < 3) return; // без снимка рекламы или слишком мало конкурентов — не точка знания
+        const ad = fromScanSnapshot(b.snap, b.t);
+        own.forEach(function (c) {
+          const nm = String(c.nmID);
+          const pos = b.byNm[nm] || [];
+          const cfg = (ad.byNm[nm] || []).map(function (a) { return a.t + " " + a.bid; });
+          points.push({
+            t: b.t, nmID: c.nmID, card: c.label,
+            ad: cfg.length ? cfg.join(" + ") : "выкл",
+            avgPos: pos.length ? Math.round(pos.reduce(function (x, y) { return x + y; }, 0) / pos.length * 10) / 10 : null,
+            present: pos.length, of: b.comps,
+          });
+        });
+      });
+
+      const sum = {};
+      points.forEach(function (p) {
+        const k = p.card + " | " + p.ad;
+        const s = sum[k] || (sum[k] = { card: p.card, ad: p.ad, n: 0, withPos: 0, sum: 0, min: null, max: null });
+        s.n++;
+        if (p.avgPos !== null) { s.withPos++; s.sum += p.avgPos; s.min = s.min === null ? p.avgPos : Math.min(s.min, p.avgPos); s.max = s.max === null ? p.avgPos : Math.max(s.max, p.avgPos); }
+      });
+      const summary = Object.keys(sum).sort().map(function (k) {
+        const s = sum[k];
+        return { card: s.card, ad: s.ad, measurements: s.n, avgPos: s.withPos ? Math.round(s.sum / s.withPos * 10) / 10 : null, best: s.min, worst: s.max };
+      });
+      res.json({ category: category, days: days, points: points, summary: summary });
+    } catch (e) {
+      console.error("ads learning error:", e.message);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   console.log("competitors-table initialised");
 };
