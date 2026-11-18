@@ -168,5 +168,20 @@ module.exports = function initCompetitorsTable(deps) {
     }
   });
 
+  // Поставить отметки «нужен замер» сразу для многих конкурентов ОДНОЙ записью.
+  // (Раньше сайт слал по запросу на каждого параллельно, и записи затирали друг друга — терялись отметки.)
+  app.post("/api/competitors-table/request-refresh", async function (req, res) {
+    try {
+      const ids = (req.body && Array.isArray(req.body.ids)) ? req.body.ids.map(String) : [];
+      const flags = await loadJson("competitor_refresh_requests", {});
+      const nowIso = new Date().toISOString();
+      ids.forEach(function (id) { flags[id] = nowIso; });
+      await deps.saveJson("competitor_refresh_requests", flags);
+      res.json({ ok: true, count: ids.length });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
   console.log("competitors-table initialised");
 };
