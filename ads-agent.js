@@ -463,6 +463,33 @@ module.exports = function initAdsAgent(deps) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
+  // Заказы по дням с самого запуска карточек (API статистики хранит заказы около 90 дней; лимит WB — 1 запрос в минуту).
+  // GET /api/ads/orders-daily?nm=1998109943,1852087714&from=2026-09-01  (ничего не пишет)
+  app.get("/api/ads/orders-daily", requireApiKey, async (req, res) => {
+    try {
+      const nmSet = {};
+      String(req.query.nm || "").split(",").map(Number).filter(Boolean).forEach(function (n) { nmSet[n] = true; });
+      if (!Object.keys(nmSet).length) return res.status(400).json({ error: "nm обязателен" });
+      const from = String(req.query.from || mskDate(60));
+      const r = await getJson("https://statistics-api.wildberries.ru/api/v1/supplier/orders?flag=0&dateFrom=" + from + "T00:00:00", { headers: headers() });
+      if (!r.ok) return res.status(502).json({ status: r.status, body: r.json || r.text });
+      const rows = Array.isArray(r.json) ? r.json : [];
+      const byNm = {};
+      rows.forEach(function (o) {
+        const nm = Number(o.nmId);
+        if (!nmSet[nm]) return;
+        const day = String(o.date || "").slice(0, 10);
+        const d = (byNm[nm] = byNm[nm] || {})[day] || (byNm[nm][day] = { orders: 0, cancels: 0, sum: 0, minPrice: null, maxPrice: null });
+        d.orders++;
+        if (o.isCancel) d.cancels++;
+        const p = Number(o.priceWithDisc || o.finishedPrice || 0);
+        d.sum += p;
+        if (p) { d.minPrice = d.minPrice === null ? p : Math.min(d.minPrice, p); d.maxPrice = d.maxPrice === null ? p : Math.max(d.maxPrice, p); }
+      });
+      res.json({ totalRows: rows.length, from: from, byNm: byNm });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   // Что умеет токен WB (без показа самого токена): срок действия и набор прав из его содержимого.
   // Расшифровываем только публичную часть JWT (без проверки подписи). Это справочная информация:
   // «только чтение» определяем по биту 30 (по документации WB; на практике не проверено записью).
