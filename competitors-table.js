@@ -14,6 +14,7 @@ module.exports = function initCompetitorsTable(deps) {
 
   const CATEGORIES = [
     { value: "gloves", label: "Перчатки" },
+    { value: "gloves_women", label: "Женские перчатки" },
     { value: "hoodies", label: "Худи" },
     { value: "shirts", label: "Рубашки" },
     { value: "other", label: "Прочее" },
@@ -25,8 +26,23 @@ module.exports = function initCompetitorsTable(deps) {
     cards.forEach(function (c) {
       const vc = String(c.vendorCode || "");
       const m = vc.match(/_(\d{2})$/);
-      if (m && /перч/i.test(vc)) {
+      // мужские: без «жен» в артикуле продавца (женские — отдельная категория gloves_women)
+      if (m && /перч/i.test(vc) && !/жен/i.test(vc)) {
         out.push({ nmID: Number(c.nmID), vendorCode: vc, label: "_" + m[1], photo: c.photo || null, n: Number(m[1]) });
+      }
+    });
+    out.sort(function (a, b) { return a.n - b.n; });
+    return out.map(function (c) { delete c.n; return c; });
+  }
+
+  // Женские перчатки: артикул продавца вида ПЕРЧ_ЖЕН_БОРД_01 — колонки «ж_01», «ж_02»…
+  function womenGlovesCards(cards) {
+    const out = [];
+    cards.forEach(function (c) {
+      const vc = String(c.vendorCode || "");
+      const m = vc.match(/_(\d{2})$/);
+      if (m && /перч/i.test(vc) && /жен/i.test(vc)) {
+        out.push({ nmID: Number(c.nmID), vendorCode: vc, label: "ж_" + m[1], photo: c.photo || null, n: Number(m[1]) });
       }
     });
     out.sort(function (a, b) { return a.n - b.n; });
@@ -149,6 +165,8 @@ module.exports = function initCompetitorsTable(deps) {
         let colCards;
         if (cat.value === "gloves") {
           colCards = glovesCards(cards);
+        } else if (cat.value === "gloves_women") {
+          colCards = womenGlovesCards(cards);
         } else {
           // для остальных категорий колонки — свои карточки, найденные в последних сканах
           colCards = Object.keys(seenNm).map(function (k) {
