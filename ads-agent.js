@@ -446,6 +446,23 @@ module.exports = function initAdsAgent(deps) {
     } catch (e) { out.error = e.message; res.status(500).json(out); }
   });
 
+  // Дневная воронка карточек (просмотры, корзины, заказы, выкупы) за период — для разбора «почему карточка выросла».
+  // GET /api/ads/funnel-history?nm=1998109943,1852087714&start=2026-11-01&end=2026-11-18  (сырой ответ WB, ничего не пишет)
+  app.get("/api/ads/funnel-history", requireApiKey, async (req, res) => {
+    try {
+      const nmIds = String(req.query.nm || "").split(",").map(Number).filter(Boolean);
+      if (!nmIds.length) return res.status(400).json({ error: "nm обязателен" });
+      const start = String(req.query.start || mskDate(7));
+      const end = String(req.query.end || mskDate(1));
+      const r = await getJson(FUNNEL_URL + "/history", {
+        method: "POST",
+        headers: { Authorization: WB_API_TOKEN, "Content-Type": "application/json" },
+        body: JSON.stringify({ selectedPeriod: { start: start, end: end }, nmIds: nmIds, skipDeletedNm: true, aggregationLevel: "day" }),
+      });
+      res.status(r.ok ? 200 : 502).json({ status: r.status, body: r.json || r.text });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   // Что умеет токен WB (без показа самого токена): срок действия и набор прав из его содержимого.
   // Расшифровываем только публичную часть JWT (без проверки подписи). Это справочная информация:
   // «только чтение» определяем по биту 30 (по документации WB; на практике не проверено записью).
