@@ -344,5 +344,29 @@ module.exports = function initCompetitorsTable(deps) {
     }
   });
 
+  // Показы/клики/расход кампании по времени внутри дня (разность соседних снимков ads_hourly, ~каждые 30 мин, МСК).
+  // GET /api/ads/day-series?id=41987099&date=2026-11-18
+  app.get("/api/ads/day-series", guard, async function (req, res) {
+    try {
+      const id = Number(req.query.id);
+      const date = String(req.query.date || "");
+      const list = await loadJson("ads_hourly", []);
+      const snaps = list.filter(function (s) { return s.date === date; }).sort(function (a, b) { return String(a.t).localeCompare(String(b.t)); });
+      const out = [];
+      let prev = null;
+      snaps.forEach(function (s) {
+        const row = (s.rows || []).filter(function (r) { return r[0] === id; })[0];
+        if (!row) return;
+        const cur = { t: s.t, views: row[1] || 0, clicks: row[2] || 0, spend: row[3] || 0, atbs: row[4] || 0, orders: row[5] || 0, status: row[7], rec: row[8], search: row[9] };
+        if (prev) {
+          const msk = new Date(Date.parse(cur.t) + 3 * 3600 * 1000).toISOString().slice(11, 16);
+          out.push({ mskTime: msk, views: cur.views - prev.views, clicks: cur.clicks - prev.clicks, spend: Math.round((cur.spend - prev.spend) * 100) / 100, atbs: cur.atbs - prev.atbs, orders: cur.orders - prev.orders, rec: cur.rec, search: cur.search });
+        }
+        prev = cur;
+      });
+      res.json({ id: id, date: date, snapshots: snaps.length, series: out });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   console.log("competitors-table initialised");
 };
