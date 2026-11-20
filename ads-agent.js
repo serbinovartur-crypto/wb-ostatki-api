@@ -493,6 +493,27 @@ module.exports = function initAdsAgent(deps) {
   // Что умеет токен WB (без показа самого токена): срок действия и набор прав из его содержимого.
   // Расшифровываем только публичную часть JWT (без проверки подписи). Это справочная информация:
   // «только чтение» определяем по биту 30 (по документации WB; на практике не проверено записью).
+  // Проба отчёта по поиску (аналитика WB): GET /api/ads/search-report?nm=1998109943&start=2026-11-13&end=2026-11-19
+  app.get("/api/ads/search-report", requireApiKey, async function (req, res) {
+    try {
+      const nm = Number(req.query.nm);
+      const start = String(req.query.start), end = String(req.query.end);
+      const url = "https://seller-analytics-api.wildberries.ru/api/v2/search-report/product/search-texts";
+      const body = {
+        currentPeriod: { start: start, end: end },
+        nmIds: [nm],
+        topOrderBy: "openToCart",
+        includeSubstitutedSKUs: true,
+        includeSearchTexts: true,
+        orderBy: { field: "openCard", mode: "desc" },
+        limit: 30
+      };
+      const r = await wbFetch(url, { method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, headers()), body: JSON.stringify(body) });
+      const t = await r.text();
+      res.json({ status: r.status, body: t.slice(0, 6000) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   app.get("/api/ads/token-info", requireApiKey, function (req, res) {
     try {
       const parts = String(WB_API_TOKEN || "").split(".");
