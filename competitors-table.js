@@ -15,6 +15,7 @@ module.exports = function initCompetitorsTable(deps) {
   const CATEGORIES = [
     { value: "gloves", label: "Перчатки" },
     { value: "gloves_women", label: "Женские перчатки" },
+    { value: "cardigans", label: "Кардиганы" },
     { value: "hoodies", label: "Худи" },
     { value: "shirts", label: "Рубашки" },
     { value: "other", label: "Прочее" },
@@ -43,6 +44,20 @@ module.exports = function initCompetitorsTable(deps) {
       const m = vc.match(/_(\d{2})$/);
       if (m && /перч/i.test(vc) && /жен/i.test(vc)) {
         out.push({ nmID: Number(c.nmID), vendorCode: vc, label: "ж_" + m[1], photo: c.photo || null, n: Number(m[1]) });
+      }
+    });
+    out.sort(function (a, b) { return a.n - b.n; });
+    return out.map(function (c) { delete c.n; return c; });
+  }
+
+  // Кардиганы: свои карточки «Кардиган_<цвет>_NN» (тестовые «Кардиган тест …» не берём).
+  function cardigansCards(cards) {
+    const out = [];
+    cards.forEach(function (c) {
+      const vc = String(c.vendorCode || "");
+      const m = vc.match(/^кардиган_.*?(\d{2})$/i);
+      if (m) {
+        out.push({ nmID: Number(c.nmID), vendorCode: vc, label: vc.replace(/^кардиган_/i, ""), photo: c.photo || null, n: Number(m[1]) });
       }
     });
     out.sort(function (a, b) { return a.n - b.n; });
@@ -167,6 +182,8 @@ module.exports = function initCompetitorsTable(deps) {
           colCards = glovesCards(cards);
         } else if (cat.value === "gloves_women") {
           colCards = womenGlovesCards(cards);
+        } else if (cat.value === "cardigans") {
+          colCards = cardigansCards(cards);
         } else {
           // для остальных категорий колонки — свои карточки, найденные в последних сканах
           colCards = Object.keys(seenNm).map(function (k) {
