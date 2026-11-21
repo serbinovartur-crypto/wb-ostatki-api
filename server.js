@@ -1619,7 +1619,7 @@ app.post("/api/competitors", requireApiKey, async (req, res) => {
       name: (name || "").trim() || ("Конкурент " + nmID),
       addedAt: new Date().toISOString(),
       active: true,
-      category: ["shirts", "hoodies", "gloves", "gloves_women", "other"].indexOf(category) !== -1 ? category : "shirts",
+      category: ["shirts", "hoodies", "gloves", "gloves_women","cardigans", "other"].indexOf(category) !== -1 ? category : "shirts",
     };
     list.push(item);
     await saveJson("competitors_list", list);
@@ -1669,7 +1669,7 @@ app.post("/api/competitors/:id/active", requireApiKey, async (req, res) => {
 app.post("/api/competitors/:id/category", requireApiKey, async (req, res) => {
     try {
           const { category } = req.body || {};
-          const allowed = ["shirts", "hoodies", "gloves", "gloves_women", "other"];
+          const allowed = ["shirts", "hoodies", "gloves", "gloves_women","cardigans", "other"];
           const list = await loadJson("competitors_list", []);
           const idx = list.findIndex(function (c) { return c.id === req.params.id; });
           if (idx === -1) {
