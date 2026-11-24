@@ -385,5 +385,19 @@ module.exports = function initCompetitorsTable(deps) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
+  // Задать конкуренту фото и название (для таблицы). POST /api/competitors-table/info {id, photo, title}
+  app.post("/api/competitors-table/info", guard, async function (req, res) {
+    try {
+      const b = req.body || {};
+      const list = await loadJson("competitors_list", []);
+      const idx = list.findIndex(function (c) { return c.id === b.id; });
+      if (idx === -1) return res.status(404).json({ error: "конкурент не найден" });
+      if (b.photo) list[idx].photo = String(b.photo);
+      if (b.title) list[idx].wbTitle = String(b.title);
+      await deps.saveJson("competitors_list", list);
+      res.json({ ok: true, competitor: list[idx] });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   console.log("competitors-table initialised");
 };
