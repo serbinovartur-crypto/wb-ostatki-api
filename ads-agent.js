@@ -532,6 +532,12 @@ module.exports = function initAdsAgent(deps) {
       const body = { from: String(req.query.from), to: String(req.query.to), items: [{ advert_id: Number(req.query.id), nm_id: Number(req.query.nm) }] };
       const r = await wbFetch(ADV + "/adv/v0/normquery/stats", { method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, headers()), body: JSON.stringify(body) });
       const t = await r.text();
+      let j = null; try { j = JSON.parse(t); } catch (e) {}
+      if (j && Array.isArray(j.stats)) {
+        const rows = [];
+        j.stats.forEach(function (s) { (s.stats || []).forEach(function (k) { rows.push({ q: k.norm_query, views: k.views, clicks: k.clicks, ctr: k.ctr, cpc: k.cpc, cpm: k.cpm, spend: k.spend, atbs: k.atbs, orders: k.orders, pos: k.avg_pos }); }); });
+        return res.json({ status: r.status, count: rows.length, rows: rows });
+      }
       res.json({ status: r.status, body: t.slice(0, 4000) });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
