@@ -282,7 +282,41 @@ module.exports = function initAdsAgent(deps) {
       }
     } catch (e) { errors.push("hourly: " + e.message); }
 
+    // ключевые фразы внутри кампаний (WB normquery): копим по дням, чтобы оценивать ключи по всей воронке.
+    try { await collectKeywords(campaigns, errors); } catch (e) { errors.push("keywords: " + e.message); }
+
     return { takenAt: snapshot.takenAt, campaigns: campaigns.length, newEvents: events.length, errors: errors };
+  }
+
+  // Сбор статистики по ключам: не чаще раза в 3 часа, только по кампаниям с активностью за последние 2 дня.
+  // Ключ записи: дата|кампания|nm|фраза. Сегодняшний и вчерашний день перезаписываются свежими значениями.
+  let lastKwAt = 0;
+  async function collectKeywords(campaigns, errors, force) {
+    if (!force && Date.now() - lastKwAt < 3 * 3600 * 1000) return;
+    lastKwAt = Date.now();
+    const from = mskDate(1), to = mskDate(0);
+    const store = await loadJson("ads_keywords", {});
+    let calls = 0;
+    for (const c of campaigns) {
+      const act = (c.stats && c.stats.days || []).some(function (d) { return (d.date === from || d.date === to) && (d.views || d.spend); });
+      if (!act) continue;
+      for (const b of (c.bids || [])) {
+        for (const day of [from, to]) {
+          if (calls++ > 0) await new Promise(function (r) { setTimeout(r, 1200); });
+          const r = await wbFetch(ADV + "/adv/v0/normquery/stats", { method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, headers()), body: JSON.stringify({ from: day, to: day, items: [{ advert_id: c.id, nm_id: b.nmID }] }) });
+          if (!r.ok) { errors.push("normquery " + c.id + " " + r.status); if (r.status === 429) return; continue; }
+          let j = null; try { j = await r.json(); } catch (e) { continue; }
+          ((j && j.stats) || []).forEach(function (s) {
+            (s.stats || []).forEach(function (k) {
+              store[day + "|" + c.id + "|" + b.nmID + "|" + k.norm_query] = { date: day, id: c.id, nm: b.nmID, q: k.norm_query, v: k.views || 0, c: k.clicks || 0, sp: k.spend || 0, a: k.atbs || 0, o: k.orders || 0, pos: k.avg_pos, cpm: k.cpm };
+            });
+          });
+        }
+      }
+    }
+    const keys = Object.keys(store).sort();
+    if (keys.length > 40000) keys.slice(0, keys.length - 40000).forEach(function (k) { delete store[k]; });
+    await saveJson("ads_keywords", store);
   }
 
   // ---- сравнение двух снимков → события журнала ---------------------------
@@ -522,6 +556,54 @@ module.exports = function initAdsAgent(deps) {
         }) });
       }
       res.json({ status: r.status, body: t.slice(0, 6000) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Принудительный сбор ключей прямо сейчас (для первой загрузки).
+  app.post("/api/ads/keywords-collect", requireApiKey, async function (req, res) {
+    try {
+      const ov = await loadJson("ads_overview_latest", null);
+      const errors = [];
+      await collectKeywords((ov && ov.campaigns) || [], errors, true);
+      res.json({ ok: true, errors: errors });
+    } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+  });
+
+  // Оценка ключей по всей воронке за период: GET /api/ads/keywords?nm=1870044934&days=7&maxCpo=217
+  // maxCpo — предельная цена заказа (₽), при которой маржа ещё не ниже целевой (по умолчанию 217).
+  // Вердикты: «мало данных» (меньше 30 кликов и меньше половины maxCpo расхода), «убрать» (0 заказов при расходе ≥1,5×maxCpo
+  // или ≥30 кликов без корзин), «дорого» (цена заказа выше maxCpo), «хороший» (цена заказа ≤ 70% maxCpo, заказов ≥2),
+  // «норма» (остальное). Вердикты — подсказки, а не приказ: смысл фразы (релевантность) проверяйте глазами.
+  app.get("/api/ads/keywords", requireApiKey, async function (req, res) {
+    try {
+      const nm = Number(req.query.nm) || null;
+      const days = Math.max(1, Math.min(60, Number(req.query.days) || 7));
+      const maxCpo = Number(req.query.maxCpo) || 217;
+      const since = mskDate(days - 1);
+      const store = await loadJson("ads_keywords", {});
+      const agg = {};
+      Object.keys(store).forEach(function (k) {
+        const r = store[k];
+        if (r.date < since || (nm && r.nm !== nm)) return;
+        const a = agg[r.q] || (agg[r.q] = { q: r.q, v: 0, c: 0, sp: 0, a: 0, o: 0, posW: 0, camps: {}, dates: {} });
+        a.v += r.v; a.c += r.c; a.sp += r.sp; a.a += r.a; a.o += r.o; a.posW += (r.pos || 0) * r.v; a.camps[r.id] = true; a.dates[r.date] = true;
+      });
+      const r2 = function (x) { return Math.round(x * 100) / 100; };
+      const totalSp = Object.keys(agg).reduce(function (s, q) { return s + agg[q].sp; }, 0);
+      const rows = Object.keys(agg).map(function (q) {
+        const a = agg[q];
+        const cpo = a.o ? a.sp / a.o : null;
+        let verdict = "норма";
+        if (a.c < 30 && a.sp < maxCpo * 0.5) verdict = "мало данных";
+        else if ((a.o === 0 && a.sp >= maxCpo * 1.5) || (a.c >= 30 && a.a === 0)) verdict = "убрать";
+        else if (cpo !== null && cpo > maxCpo) verdict = "дорого";
+        else if (cpo !== null && cpo <= maxCpo * 0.7 && a.o >= 2) verdict = "хороший";
+        return { q: q, views: a.v, clicks: a.c, ctrPct: a.v ? r2(a.c / a.v * 100) : null, spend: r2(a.sp), cpc: a.c ? r2(a.sp / a.c) : null,
+          carts: a.a, cartPerClickPct: a.c ? r2(a.a / a.c * 100) : null, orders: a.o, orderPerClickPct: a.c ? r2(a.o / a.c * 100) : null,
+          costPerOrder: cpo !== null ? r2(cpo) : null, avgPos: a.v ? r2(a.posW / a.v) : null, spendSharePct: totalSp ? r2(a.sp / totalSp * 100) : null,
+          days: Object.keys(a.dates).length, campaigns: Object.keys(a.camps).map(Number), verdict: verdict };
+      }).sort(function (x, y) { return y.spend - x.spend; });
+      res.json({ nm: nm, days: days, from: since, maxCpo: maxCpo, totalSpend: r2(totalSp), count: rows.length, rows: rows });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
