@@ -506,11 +506,33 @@ module.exports = function initAdsAgent(deps) {
         includeSubstitutedSKUs: true,
         includeSearchTexts: true,
         orderBy: { field: "openCard", mode: "desc" },
-        limit: 30
+        limit: Math.min(Number(req.query.limit) || 30, 100)
       };
       const r = await wbFetch(url, { method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, headers()), body: JSON.stringify(body) });
       const t = await r.text();
+      if (req.query.compact) {
+        // Компактный разбор: по каждому запросу частота, позиция, открытия, корзины, заказы и конверсии (за период).
+        let j = null; try { j = JSON.parse(t); } catch (e) {}
+        const items = (j && j.data && j.data.items) || null;
+        if (!items) return res.json({ status: r.status, body: t.slice(0, 2000) });
+        const g = function (o) { return o && o.current != null ? o.current : null; };
+        return res.json({ status: r.status, count: items.length, items: items.map(function (x) {
+          return { q: x.text, freq: g(x.frequency), avgPos: g(x.avgPosition), open: g(x.openCard), cart: g(x.addToCart), orders: g(x.orders),
+            openToCart: g(x.openToCart), cartToOrder: g(x.cartToOrder), visibility: g(x.visibility) };
+        }) });
+      }
       res.json({ status: r.status, body: t.slice(0, 6000) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Проба статистики по ключевым фразам внутри рекламной кампании (WB: normquery). Ничего не пишет.
+  // GET /api/ads/keywords-probe?id=41172979&nm=1870044934&from=2026-11-27&to=2026-11-27
+  app.get("/api/ads/keywords-probe", requireApiKey, async function (req, res) {
+    try {
+      const body = { from: String(req.query.from), to: String(req.query.to), items: [{ advert_id: Number(req.query.id), nm_id: Number(req.query.nm) }] };
+      const r = await wbFetch(ADV + "/adv/v0/normquery/stats", { method: "POST", headers: Object.assign({ "Content-Type": "application/json" }, headers()), body: JSON.stringify(body) });
+      const t = await r.text();
+      res.json({ status: r.status, body: t.slice(0, 4000) });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
