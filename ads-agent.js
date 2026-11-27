@@ -515,10 +515,20 @@ module.exports = function initAdsAgent(deps) {
         const day = String(o.date || "").slice(0, 10);
         const d = (byNm[nm] = byNm[nm] || {})[day] || (byNm[nm][day] = { orders: 0, cancels: 0, sum: 0, minPrice: null, maxPrice: null });
         d.orders++;
+        d.sppSum = (d.sppSum || 0) + Number(o.spp || 0);
+        d.finSum = (d.finSum || 0) + Number(o.finishedPrice || 0);
         if (o.isCancel) d.cancels++;
         const p = Number(o.priceWithDisc || o.finishedPrice || 0);
         d.sum += p;
         if (p) { d.minPrice = d.minPrice === null ? p : Math.min(d.minPrice, p); d.maxPrice = d.maxPrice === null ? p : Math.max(d.maxPrice, p); }
+      });
+      Object.keys(byNm).forEach(function (n) {
+        Object.keys(byNm[n]).forEach(function (day) {
+          const d = byNm[n][day];
+          d.avgSpp = d.orders ? Math.round(d.sppSum / d.orders * 10) / 10 : null;      // средняя СПП, %
+          d.avgBuyerPrice = d.orders ? Math.round(d.finSum / d.orders) : null;       // средняя цена для покупателя, ₽
+          delete d.sppSum; delete d.finSum;
+        });
       });
       res.json({ totalRows: rows.length, from: from, byNm: byNm });
     } catch (e) { res.status(500).json({ error: e.message }); }
